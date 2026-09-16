@@ -40,10 +40,20 @@ jobs:
         run: |
           set -o pipefail
           if ! cargo clippy --workspace --all-targets --all-features -- -D warnings 2>&1 | tee /tmp/clippy.log; then
-            # 仓库日志需要 admin 权限才能下载，annotation 则是公开可读的。
-            grep -E '^error' /tmp/clippy.log | head -8 | while IFS= read -r line; do
+            # 仓库日志需要 admin 权限才能下载，annotation 则是公开可读的，
+            # 所以把错误摘要送进 annotation。注意先剥掉 ANSI 颜色码：
+            # CARGO_TERM_COLOR=always 会让错误行以转义序列开头，直接 grep '^error' 匹配不到。
+            sed -e 's/\x1b\[[0-9;]*m//g' /tmp/clippy.log > /tmp/clippy-plain.log
+            grep -nE '^(error|warning)' /tmp/clippy-plain.log | head -10 | while IFS= read -r line; do
               echo "::error::$line"
             done
+            # 再附上第一处报错的上下文，通常足以定位。
+            FIRST=$(grep -nE '^error' /tmp/clippy-plain.log | head -1 | cut -d: -f1)
+            if [ -n "$FIRST" ]; then
+              sed -n "${FIRST},$((FIRST+12))p" /tmp/clippy-plain.log | while IFS= read -r line; do
+                echo "::error::  $line"
+              done
+            fi
             exit 1
           fi
 
