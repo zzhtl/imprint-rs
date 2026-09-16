@@ -21,11 +21,11 @@ jobs:
           - name: linux-x86_64
             os: ubuntu-latest
             archive: tar.gz
+          # macOS 只发 Apple Silicon：Intel 机型已在退场，而 macos-13 的
+          # Intel runner 在 GitHub 上极其紧缺，实测连续两轮都排不到，
+          # 会把整个发布流程卡死。
           - name: macos-arm64
             os: macos-latest
-            archive: tar.gz
-          - name: macos-x86_64
-            os: macos-13
             archive: tar.gz
           - name: windows-x86_64
             os: windows-latest
@@ -220,6 +220,12 @@ jobs:
 
             - `imprint`：命令行工具，适合服务器与 CI
             - `imprint-ui`：桌面图形界面
+
+            ## 平台
+
+            - Linux x86_64
+            - Windows x86_64
+            - macOS **Apple Silicon（M 系列）**；不提供 Intel 版本
 
             ## 第三方许可
 
