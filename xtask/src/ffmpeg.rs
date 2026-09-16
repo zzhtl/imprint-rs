@@ -614,13 +614,48 @@ fn shell_script(script: &str) -> Command {
 
 /// 转成 MSYS2 的 bash / GNU make 都能理解的路径写法。
 ///
-/// Windows 的反斜杠会被 shell 当成转义符，正斜杠两边都认。
+/// Windows 上光把反斜杠换成正斜杠还不够：`PREFIX=C:/foo` 交给 GNU make 时，
+/// 冒号会被当成目标与依赖的分隔符，必须写成 MSYS2 的 `/c/foo` 形式。
 fn shell_path(path: &Path) -> String {
-    let s = path.display().to_string();
-    if cfg!(windows) {
-        s.replace('\\', "/")
-    } else {
-        s
+    let raw = path.display().to_string();
+    if !cfg!(windows) {
+        return raw;
+    }
+    to_msys_path(&raw)
+}
+
+/// `C:\a\b` / `C:/a/b` → `/c/a/b`；其余原样返回（只换分隔符）。
+fn to_msys_path(raw: &str) -> String {
+    let slashed = raw.replace('\\', "/");
+    let bytes = slashed.as_bytes();
+    if bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && bytes[2] == b'/'
+    {
+        return format!(
+            "/{}/{}",
+            (bytes[0] as char).to_ascii_lowercase(),
+            &slashed[3..]
+        );
+    }
+    slashed
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn msys_path_converts_drive_letters() {
+        assert_eq!(to_msys_path(r"C:\a\b"), "/c/a/b");
+        assert_eq!(to_msys_path("D:/x/y"), "/d/x/y");
+        // 已经是 Unix 风格或相对路径的，只做分隔符替换。
+        assert_eq!(to_msys_path("/usr/local"), "/usr/local");
+        assert_eq!(to_msys_path("relative/path"), "relative/path");
+        assert_eq!(to_msys_path(r"relative\path"), "relative/path");
+        // 不是盘符的冒号不该被误伤。
+        assert_eq!(to_msys_path("ab:/x"), "ab:/x");
     }
 }
 

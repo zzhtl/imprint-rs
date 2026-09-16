@@ -88,7 +88,23 @@ jobs:
       - name: 构建裁剪版 ffmpeg（Windows）
         if: runner.os == 'Windows' && steps.ffmpeg-cache.outputs.cache-hit != 'true'
         shell: msys2 {0}
-        run: cargo xtask build-ffmpeg
+        run: |
+          set -o pipefail
+          # MSYS2 与 Windows 侧工具链混用，先把关键工具的可见性打出来：
+          # 缺哪个都会让后面的失败难以定位。
+          echo "::group::工具链自检"
+          for t in cargo rustc bash make gcc nasm pkg-config git tar; do
+            printf '%-12s %s\n' "$t" "$(command -v $t || echo '缺失')"
+          done
+          echo "::endgroup::"
+
+          if ! cargo xtask build-ffmpeg 2>&1 | tee /tmp/ffbuild.log; then
+            # 仓库日志需要 admin 权限，annotation 是公开可读的。
+            sed -e 's/\x1b\[[0-9;]*m//g' /tmp/ffbuild.log | tail -30 | while IFS= read -r line; do
+              echo "::error::$line"
+            done
+            exit 1
+          fi
 
       - name: 构建产品
         run: cargo build --release --workspace
