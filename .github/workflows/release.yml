@@ -1,0 +1,208 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  # 手动触发：用来验证三端打包，不必真的打一个 tag。
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      # 不要一个平台挂了就掐掉其余的 —— 一次跑完才能看到所有平台的问题。
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x86_64
+            os: ubuntu-latest
+            archive: tar.gz
+          - name: macos-arm64
+            os: macos-latest
+            archive: tar.gz
+          - name: macos-x86_64
+            os: macos-13
+            archive: tar.gz
+          - name: windows-x86_64
+            os: windows-latest
+            archive: zip
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装 Rust
+        run: rustup toolchain install stable --profile minimal
+
+      # winit/wgpu 在 Linux 上要 X11 与 Wayland 的开发头文件才能编译 UI。
+      - name: 安装系统依赖（Linux）
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            nasm libxkbcommon-dev libwayland-dev libxrandr-dev libxi-dev \
+            libxcursor-dev libgl1-mesa-dev
+
+      - name: 安装汇编器（macOS）
+        if: runner.os == 'macOS'
+        run: brew install nasm
+
+      # Windows 上 ffmpeg 的 configure 是 shell 脚本，必须有 MSYS2 才能跑。
+      # path-type: inherit 让 MSYS2 shell 继承 Windows 的 PATH，从而能用到 cargo。
+      - name: 准备 MSYS2（Windows）
+        if: runner.os == 'Windows'
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          path-type: inherit
+          update: true
+          install: >-
+            base-devel
+            mingw-w64-x86_64-gcc
+            mingw-w64-x86_64-pkgconf
+            nasm
+            make
+            diffutils
+            git
+
+      - uses: Swatinem/rust-cache@v2
+
+      # ffmpeg 一次要编好几分钟，配置没变就直接复用上一次的产物。
+      - name: 缓存 ffmpeg 产物
+        id: ffmpeg-cache
+        uses: actions/cache@v4
+        with:
+          path: dist
+          key: ffmpeg-${{ matrix.name }}-${{ hashFiles('xtask/src/ffmpeg.rs') }}
+
+      - name: 构建裁剪版 ffmpeg（非 Windows）
+        if: runner.os != 'Windows' && steps.ffmpeg-cache.outputs.cache-hit != 'true'
+        run: cargo xtask build-ffmpeg
+
+      - name: 构建裁剪版 ffmpeg（Windows）
+        if: runner.os == 'Windows' && steps.ffmpeg-cache.outputs.cache-hit != 'true'
+        shell: msys2 {0}
+        run: cargo xtask build-ffmpeg
+
+      - name: 构建产品
+        run: cargo build --release --workspace
+
+      - name: 测试
+        shell: bash
+        run: |
+          set -euo pipefail
+          EXE=""
+          [ "${{ runner.os }}" = "Windows" ] && EXE=".exe"
+          # 把刚编好的 ffmpeg 交给视频测试，让它们真的跑起来而不是跳过。
+          export IMPRINT_TEST_FFMPEG="$PWD/dist/ffmpeg$EXE"
+          cargo test --release --workspace --all-features
+
+      - name: 冒烟测试
+        shell: bash
+        run: |
+          set -euo pipefail
+          EXE=""
+          [ "${{ runner.os }}" = "Windows" ] && EXE=".exe"
+          BIN="target/release/imprint$EXE"
+          FFMPEG="$PWD/dist/ffmpeg$EXE"
+          PY=python3
+          command -v python3 >/dev/null 2>&1 || PY=python
+
+          "$BIN" --version
+          # probe 一次覆盖 ffmpeg 定位、编码器探测、中文字体，是最快的整体健康检查。
+          "$BIN" probe --ffmpeg "$FFMPEG"
+
+          # 端到端：造一张图 -> 加中文平铺水印 -> 确认产出非空。
+          # 用 python 喂原始像素而不是 /dev/zero：后者在 Windows 上不可靠。
+          mkdir -p smoke/in
+          "$PY" -c "import sys; sys.stdout.buffer.write(bytes(64*64*3))" \
+            | "$FFMPEG" -hide_banner -loglevel error -y \
+                -f rawvideo -pix_fmt rgb24 -s 64x64 -i pipe:0 -frames:v 1 smoke/in/a.png
+
+          "$BIN" image -i smoke/in -o smoke/out --text "水印 {filename}" --tile --opacity 0.3 --format png
+          test -s smoke/out/a.png || { echo "::error::图片水印产出为空"; exit 1; }
+
+          # 视频链路：把这张图拉成 2 秒视频再加水印，验证 overlay + 编码 + 封装。
+          "$FFMPEG" -hide_banner -loglevel error -y -loop 1 -i smoke/in/a.png \
+            -t 2 -r 10 -c:v libopenh264 -pix_fmt yuv420p smoke/clip.mp4
+          "$BIN" video -i smoke/clip.mp4 -o smoke/clip_wm.mp4 --ffmpeg "$FFMPEG" \
+            --text "水印" --tile --opacity 0.3
+          test -s smoke/clip_wm.mp4 || { echo "::error::视频水印产出为空"; exit 1; }
+          echo "冒烟测试通过"
+
+      # ffmpeg 命中缓存时上面的构建步骤会被跳过，许可声明仍必须随包产出。
+      - name: 生成许可声明
+        run: cargo xtask notices
+
+      - name: 打包
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME}"
+          [ "${{ github.event_name }}" = "workflow_dispatch" ] && VERSION="dev-${GITHUB_SHA::7}"
+          PKG="imprint-${VERSION}-${{ matrix.name }}"
+          EXE_SUFFIX=""
+          [ "${{ runner.os }}" = "Windows" ] && EXE_SUFFIX=".exe"
+
+          mkdir -p "$PKG"
+          cp "target/release/imprint${EXE_SUFFIX}" "$PKG/"
+          cp "target/release/imprint-ui${EXE_SUFFIX}" "$PKG/"
+          # ffmpeg 必须与可执行文件同目录：产品按「同目录 -> PATH」的顺序查找它。
+          cp "dist/ffmpeg${EXE_SUFFIX}" "$PKG/"
+          # LGPL 要求随二进制附上许可声明与源码获取方式。
+          cp dist/THIRD_PARTY_NOTICES.txt "$PKG/"
+          [ -f README.md ] && cp README.md "$PKG/"
+
+          if [ "${{ matrix.archive }}" = "zip" ]; then
+            7z a "${PKG}.zip" "$PKG"
+          else
+            tar -czf "${PKG}.tar.gz" "$PKG"
+          fi
+          ls -la imprint-*.* 
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: imprint-${{ matrix.name }}
+          path: |
+            imprint-*.tar.gz
+            imprint-*.zip
+          if-no-files-found: error
+
+  release:
+    name: 发布
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: 创建 Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          # 内置的 ffmpeg 是 LGPL v2.1，发布说明里要讲清楚，别让使用者以为整包是一个许可。
+          NOTES: |
+            ## 安装
+
+            解压后直接运行，无需额外安装 ffmpeg —— 包内已附带裁剪版（约 7.5 MB）。
+
+            - `imprint`：命令行工具，适合服务器与 CI
+            - `imprint-ui`：桌面图形界面
+
+            ## 第三方许可
+
+            本包内置 FFmpeg（LGPL v2.1）与 OpenH264（BSD），未启用 x264/x265 等 GPL 组件。
+            详见包内 `THIRD_PARTY_NOTICES.txt`。
+        run: |
+          gh release create "${GITHUB_REF_NAME}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --title "imprint ${GITHUB_REF_NAME}" \
+            --notes "$NOTES" \
+            artifacts/*

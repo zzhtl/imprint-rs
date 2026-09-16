@@ -1,0 +1,19 @@
+[package]
+name = "xtask"
+description = "构建辅助工具：编译裁剪版 ffmpeg 并打包"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+# 注意：xtask 的依赖**不会**进入产品依赖树（imprint-core / cli / ui），
+# 所以这里用 ureq（经 rustls → ring 引入 cc）不影响"产品零 C 依赖"的约束。
+[dependencies]
+# 自检直接复用产品侧的探测命令，保证"自检通过"等于"产品能用"。
+imprint-core = { workspace = true }
+anyhow.workspace = true
+clap.workspace = true
+ureq.workspace = true
+sha2.workspace = true
+# 构建后自检要造测试图并比对像素
+image.workspace = true

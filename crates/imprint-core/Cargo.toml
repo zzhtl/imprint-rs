@@ -1,0 +1,28 @@
+[package]
+name = "imprint-core"
+description = "图片 / 视频水印渲染核心，纯 Rust，无 UI 依赖"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+default = []
+# 桌面端视频管线：驱动外部 ffmpeg 二进制。移动端不启用（见 plan 阶段 5）。
+sidecar = ["dep:ffmpeg-sidecar"]
+# 矢量 Logo 水印
+svg = ["dep:resvg"]
+
+[dependencies]
+image.workspace = true
+tiny-skia.workspace = true
+cosmic-text.workspace = true
+kamadak-exif.workspace = true
+chrono.workspace = true
+rayon.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+log.workspace = true
+
+ffmpeg-sidecar = { workspace = true, optional = true }
+resvg = { workspace = true, optional = true }

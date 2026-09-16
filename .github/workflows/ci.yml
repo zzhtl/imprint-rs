@@ -1,0 +1,71 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  check:
+    name: 格式 / lint / 测试
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装 Rust
+        run: rustup toolchain install stable --profile minimal --component rustfmt,clippy
+
+      # UI 依赖 winit/wgpu，Linux 上需要 X11 与 Wayland 的开发头文件才能编译。
+      - name: 安装系统依赖
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libxkbcommon-dev libwayland-dev libxrandr-dev libxi-dev \
+            libxcursor-dev libgl1-mesa-dev
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: 格式
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+      # 视频相关的测试会在检测不到 ffmpeg 时自行跳过，所以这里不编 ffmpeg，保持快速反馈。
+      - name: 测试
+        run: cargo test --workspace --all-features
+
+      - name: 核对纯 Rust 依赖约束
+        run: |
+          set -euo pipefail
+          # imprint-core 与 imprint-cli 必须零 C 构建依赖；
+          # imprint-ui 例外（Linux 的 Wayland 链会引入 cc/pkg-config），xtask 也例外（它不进产品）。
+          for pkg in imprint-core imprint-cli; do
+            count=$(cargo tree -p "$pkg" --all-features -e normal,build \
+              | grep -cE '(^|[^a-z-])(cc|pkg-config|bindgen|cmake) v' || true)
+            echo "$pkg: $count 个 C 构建依赖"
+            if [ "$count" -ne 0 ]; then
+              echo "::error::$pkg 引入了 C 构建依赖，违反纯 Rust 约束"
+              cargo tree -p "$pkg" --all-features -e normal,build -i cc || true
+              exit 1
+            fi
+          done
+
+  android:
+    name: Android 交叉编译（core）
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: 安装 Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup target add aarch64-linux-android
+      - uses: Swatinem/rust-cache@v2
+      # 只验证 core 能为移动端编译：不启用 sidecar（Android 不能 exec 外部二进制）。
+      - name: 检查 imprint-core
+        run: cargo check -p imprint-core --target aarch64-linux-android --no-default-features

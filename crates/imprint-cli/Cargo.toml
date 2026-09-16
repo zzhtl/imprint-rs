@@ -1,0 +1,20 @@
+[package]
+name = "imprint-cli"
+description = "imprint 命令行工具：无桌面环境下给图片/视频加水印"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "imprint"
+path = "src/main.rs"
+
+[dependencies]
+imprint-core = { workspace = true, features = ["sidecar", "svg"] }
+clap.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+log.workspace = true
+env_logger.workspace = true
+rayon.workspace = true

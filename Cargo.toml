@@ -1,0 +1,78 @@
+[workspace]
+resolver = "3"
+members = ["crates/imprint-cli", "crates/imprint-core", "crates/imprint-ui", "xtask"]
+# xtask 是构建工具，不该参与日常的 `cargo build` / `cargo test`。
+default-members = [
+    "crates/imprint-cli",
+    "crates/imprint-core",
+    "crates/imprint-ui",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/zzhtl/imprint-rs"
+
+[workspace.dependencies]
+# --- 图像 ---
+# 去掉 avif：它拉进 ravif -> rav1e，编译时间大涨而我们用不到。
+# 去掉 dds/exr/ff/hdr/ico/pnm/qoi/tga：水印场景不需要。
+image = { version = "0.25.10", default-features = false, features = [
+    "jpeg",
+    "png",
+    "webp",
+    "tiff",
+    "bmp",
+    "gif",
+    "rayon",
+] }
+tiny-skia = "0.12.0"
+resvg = "0.48.1"
+
+# --- 文字 ---
+cosmic-text = "0.19.0"
+
+# --- 元数据 ---
+kamadak-exif = "0.6.1"
+# 动态字段 {datetime} 需要本地时区，std 给不了。clock+std 之外的默认 feature
+# （wasm / serde / android-tzdata）此处用不到，关掉以保持依赖面最小。
+chrono = { version = "0.4.45", default-features = false, features = ["clock", "std"] }
+
+# --- 视频 ---
+# CRITICAL: 默认 feature `download_ffmpeg` 会拉 xz2 -> lzma-sys -> build-deps cc + pkg-config，
+# 直接违反纯 Rust 构建链约束。关掉后失去 auto_download()，ffmpeg 定位由我们自己做。
+ffmpeg-sidecar = { version = "2.5.2", default-features = false }
+
+# --- 通用 ---
+rayon = "1.12.0"
+serde = { version = "1", features = ["derive"] }
+thiserror = "2"
+log = "0.4"
+
+# --- UI ---
+eframe = "0.36.2"
+egui = "0.36.2"
+# 默认 feature 已是 xdg-portal + wayland（无 GTK、无 pkg-config）。
+rfd = "0.17.2"
+env_logger = "0.11"
+anyhow = "1"
+serde_json = "1"
+clap = { version = "4", features = ["derive", "wrap_help"] }
+# 仅供 xtask 使用（构建工具，不进产品依赖树）
+ureq = "3.4.2"
+sha2 = "0.11.0"
+
+# --- workspace 内部 ---
+imprint-core = { path = "crates/imprint-core" }
+
+# 分发用的构建配置。体积是这个项目的硬指标（ffmpeg 已经裁到 7.5 MB，
+# 不该让 Rust 二进制本身反倒占大头）。
+[profile.release]
+# 调试符号在发布包里占一半以上体积，而用户拿不到源码也用不上它。
+strip = true
+# 跨 crate 内联，兼顾体积与速度；"fat" 收益有限但编译时间翻倍。
+lto = "thin"
+# 单个代码生成单元让优化器看到全貌，编译更慢、产物更小更快。
+codegen-units = 1
+# 不设 panic = "abort"：测试依赖 unwind，UI 里也不希望一处 panic 就整个进程消失。

@@ -1,0 +1,27 @@
+[package]
+name = "imprint-ui"
+description = "imprint 桌面端 UI：预览、参数输入、文件选择"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+imprint-core = { workspace = true, features = ["sidecar", "svg"] }
+eframe.workspace = true
+egui.workspace = true
+rfd.workspace = true
+env_logger.workspace = true
+log.workspace = true
+image.workspace = true
+rayon.workspace = true
+anyhow.workspace = true
+serde_json.workspace = true
+serde.workspace = true
+
+# 全 workspace 唯一的 C 构建依赖（cc + pkg-config）来自 Linux 的 Wayland 链：
+#   wayland-sys(build: pkg-config) <- wayland-backend(build: cc) <- winit/rfd 的 wayland feature
+# 实测关掉 eframe/rfd 的 wayland feature 可让 C 依赖清零，但需手工接管 winit 的
+# feature 传递（winit/default 带的 rwh_06 是 wgpu 建 surface 必需的），且 Wayland 会话
+# 下会退到 XWayland —— 分数缩放时预览发虚，对图像工具是实打实的损失。
+# imprint-core 本身（含 sidecar + svg 全 feature）已验证零 C 依赖，该约束在核心层已达成。
