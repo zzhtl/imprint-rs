@@ -44,7 +44,11 @@ pub struct BuildArgs {
     pub out: PathBuf,
 
     /// 构建工作目录
-    #[arg(long, default_value = "target/ffmpeg-build")]
+    ///
+    /// 刻意放在 `target/` 之外：`Swatinem/rust-cache` 会缓存整个 `target/`，
+    /// 把几百 MB 的 ffmpeg 源码一起塞进缓存既浪费，又会在下一次构建时
+    /// 恢复出上一轮失败残留的半成品目录。
+    #[arg(long, default_value = ".ffmpeg-build")]
     pub work: PathBuf,
 
     /// 并行编译任务数，默认取 CPU 核心数
@@ -313,7 +317,8 @@ fn ensure_assembler() -> anyhow::Result<()> {
 /// 下载并解压源码，返回源码目录。
 fn ensure_source(args: &BuildArgs, work: &Path) -> anyhow::Result<PathBuf> {
     let dir = work.join(format!("ffmpeg-{}", args.version));
-    if args.incremental && dir.is_dir() {
+    // 同样看关键文件而非目录本身，理由见 build_openh264。
+    if args.incremental && dir.join("configure").is_file() {
         println!("复用已有源码 {}", dir.display());
         return Ok(dir);
     }
@@ -425,7 +430,10 @@ fn build_openh264(args: &BuildArgs, work: &Path) -> anyhow::Result<PathBuf> {
     }
 
     let src = work.join(format!("openh264-{OPENH264_VERSION}"));
-    if !src.is_dir() {
+    // 判据是"Makefile 在不在"，而不是"目录在不在"：rust-cache 会把整个 target/
+    // 连同上一轮失败残留的空目录一起恢复，只看目录存在会跳过 clone，
+    // 接着 make 就会报 "No targets specified and no makefile found"。
+    if !src.join("Makefile").is_file() {
         // 用 git 按 tag 取源码，而不是下载 GitHub 自动生成的 tarball ——
         // 那种 tarball 的字节内容并不保证长期稳定，钉死哈希反而会无故失败。
         println!("拉取 openh264 v{OPENH264_VERSION}");
@@ -656,12 +664,33 @@ fn concat_enable(flag: &str, items: &[&str]) -> String {
 /// Windows 的 `CreateProcess` 不认 shebang，必须显式交给 bash —— CI 上由 MSYS2 提供。
 fn shell_script(script: &str) -> Command {
     if cfg!(windows) {
-        let mut cmd = Command::new("bash");
+        let mut cmd = Command::new(windows_bash());
         cmd.arg(script);
         cmd
     } else {
         Command::new(script)
     }
+}
+
+/// Windows 上该用哪个 bash。
+///
+/// **不能直接用 `bash`**：`C:\Windows\System32\bash.exe` 是 WSL 的入口，
+/// 它在 PATH 里的优先级高于 MSYS2，而 CI runner 上没装任何 WSL 发行版，
+/// 调用它只会得到 "Windows Subsystem for Linux has no installed distributions"。
+/// 构建脚本通过 `IMPRINT_BASH` 显式指定 MSYS2 的 bash（Windows 形式的绝对路径）。
+fn windows_bash() -> std::ffi::OsString {
+    if let Some(explicit) = std::env::var_os("IMPRINT_BASH")
+        && !explicit.is_empty()
+    {
+        return explicit;
+    }
+    // 兜底：MSYS2 默认安装位置。
+    for candidate in [r"C:\msys64\usr\bin\bash.exe", r"C:\msys2\usr\bin\bash.exe"] {
+        if Path::new(candidate).is_file() {
+            return candidate.into();
+        }
+    }
+    "bash".into()
 }
 
 /// 转成 MSYS2 的 bash / GNU make 都能理解的路径写法。

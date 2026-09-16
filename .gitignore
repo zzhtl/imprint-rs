@@ -27,3 +27,6 @@ target
 /imprint-*-*.tar.gz
 /imprint-*-*.zip
 /imprint-*-*/
+
+# xtask 的 ffmpeg 构建工作目录（刻意放在 target/ 之外，避免被 rust-cache 缓存）
+/.ffmpeg-build

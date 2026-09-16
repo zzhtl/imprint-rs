@@ -96,6 +96,10 @@ jobs:
         shell: msys2 {0}
         run: |
           set -o pipefail
+          # PATH 里的 bash 很可能是 System32 的 WSL 入口（runner 上没装发行版，
+          # 调用它必然失败）。把 MSYS2 自己的 bash 以 Windows 路径形式传给 xtask。
+          export IMPRINT_BASH="$(cygpath -w "$(command -v bash)")"
+          echo "IMPRINT_BASH=$IMPRINT_BASH"
           # MSYS2 与 Windows 侧工具链混用，先把关键工具的可见性打出来。
           echo "::group::工具链自检"
           for t in cargo rustc bash make gcc nasm pkg-config git tar; do
