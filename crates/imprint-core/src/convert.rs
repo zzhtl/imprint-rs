@@ -23,7 +23,10 @@ pub fn rgba_image_to_pixmap(img: &RgbaImage) -> Result<Pixmap> {
         .par_chunks_mut(row_len)
         .zip(img.as_raw().par_chunks(row_len * 4))
         .for_each(|(dst_row, src_row)| {
-            for (dst, src) in dst_row.iter_mut().zip(src_row.chunks_exact(4)) {
+            // as_chunks 给出的是 `&[u8; 4]`，长度在编译期已知，省掉逐次索引的边界检查；
+            // 余数必然为空，因为 RGBA 每像素恰好 4 字节。
+            let (pixels, _) = src_row.as_chunks::<4>();
+            for (dst, src) in dst_row.iter_mut().zip(pixels) {
                 *dst = premultiply(src[0], src[1], src[2], src[3]);
             }
         });
