@@ -350,14 +350,46 @@ fn ensure_source(args: &BuildArgs, work: &Path) -> anyhow::Result<PathBuf> {
     Ok(dir)
 }
 
+/// 网络操作的重试次数。
+///
+/// CI runner 拉源码时偶尔会超时或被重置；构建整体要十几分钟，
+/// 为一次瞬时网络抖动重跑一遍不划算。
+const NETWORK_RETRIES: u32 = 3;
+
 fn download(url: &str, dst: &Path) -> anyhow::Result<()> {
-    let mut resp = ureq::get(url).call().context("下载失败")?;
-    let mut body = resp.body_mut().as_reader();
     let tmp = dst.with_extension("part");
-    let mut file = std::fs::File::create(&tmp)?;
-    std::io::copy(&mut body, &mut file)?;
-    // 先写临时文件再改名：中途失败不会留下一个看起来完整的坏包。
-    std::fs::rename(&tmp, dst)?;
+    let mut last_err = None;
+
+    for attempt in 1..=NETWORK_RETRIES {
+        match try_download(url, &tmp) {
+            Ok(()) => {
+                // 先写临时文件再改名：中途失败不会留下一个看起来完整的坏包。
+                std::fs::rename(&tmp, dst)?;
+                return Ok(());
+            }
+            Err(e) => {
+                eprintln!("下载失败（第 {attempt}/{NETWORK_RETRIES} 次）：{e:#}");
+                let _ = std::fs::remove_file(&tmp);
+                last_err = Some(e);
+                if attempt < NETWORK_RETRIES {
+                    std::thread::sleep(std::time::Duration::from_secs(u64::from(attempt) * 3));
+                }
+            }
+        }
+    }
+
+    Err(last_err.unwrap_or_else(|| anyhow::anyhow!("下载失败")))
+        .with_context(|| format!("重试 {NETWORK_RETRIES} 次后仍无法下载 {url}"))
+}
+
+fn try_download(url: &str, tmp: &Path) -> anyhow::Result<()> {
+    let mut resp = ureq::get(url).call().context("发起请求失败")?;
+    let mut body = resp.body_mut().as_reader();
+    let mut file = std::fs::File::create(tmp)?;
+    let bytes = std::io::copy(&mut body, &mut file).context("写入响应体失败")?;
+    if bytes == 0 {
+        bail!("响应体为空");
+    }
     Ok(())
 }
 
@@ -397,13 +429,33 @@ fn build_openh264(args: &BuildArgs, work: &Path) -> anyhow::Result<PathBuf> {
         // 用 git 按 tag 取源码，而不是下载 GitHub 自动生成的 tarball ——
         // 那种 tarball 的字节内容并不保证长期稳定，钉死哈希反而会无故失败。
         println!("拉取 openh264 v{OPENH264_VERSION}");
-        run_command(
-            Command::new("git")
-                .args(["clone", "--depth", "1", "--branch"])
-                .arg(format!("v{OPENH264_VERSION}"))
-                .arg("https://github.com/cisco/openh264.git")
-                .arg(&src),
-        )?;
+        let mut last_err = None;
+        for attempt in 1..=NETWORK_RETRIES {
+            // clone 失败会留下半个目录，重试前必须清掉，否则 git 会拒绝写入非空目录。
+            let _ = std::fs::remove_dir_all(&src);
+            match run_command(
+                Command::new("git")
+                    .args(["clone", "--depth", "1", "--branch"])
+                    .arg(format!("v{OPENH264_VERSION}"))
+                    .arg("https://github.com/cisco/openh264.git")
+                    .arg(&src),
+            ) {
+                Ok(()) => {
+                    last_err = None;
+                    break;
+                }
+                Err(e) => {
+                    eprintln!("拉取失败（第 {attempt}/{NETWORK_RETRIES} 次）：{e:#}");
+                    last_err = Some(e);
+                    if attempt < NETWORK_RETRIES {
+                        std::thread::sleep(std::time::Duration::from_secs(u64::from(attempt) * 3));
+                    }
+                }
+            }
+        }
+        if let Some(e) = last_err {
+            return Err(e).context("拉取 openh264 源码失败");
+        }
     }
 
     let jobs = jobs(args);
@@ -628,11 +680,7 @@ fn shell_path(path: &Path) -> String {
 fn to_msys_path(raw: &str) -> String {
     let slashed = raw.replace('\\', "/");
     let bytes = slashed.as_bytes();
-    if bytes.len() >= 3
-        && bytes[0].is_ascii_alphabetic()
-        && bytes[1] == b':'
-        && bytes[2] == b'/'
-    {
+    if bytes.len() >= 3 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' && bytes[2] == b'/' {
         return format!(
             "/{}/{}",
             (bytes[0] as char).to_ascii_lowercase(),
