@@ -46,6 +46,8 @@ enum Command {
     Image(ImageCmd),
     /// 给视频加水印
     Video(VideoCmd),
+    /// 从图片中移除本工具添加的水印（需提供当初的参数）
+    Remove(RemoveCmd),
     /// 查看素材信息与 ffmpeg 可用性
     Probe(ProbeCmd),
 }
@@ -133,6 +135,43 @@ struct VideoCmd {
 }
 
 #[derive(Args)]
+struct RemoveCmd {
+    /// 输入文件或目录，可给多个
+    #[arg(short, long, required = true, num_args = 1..)]
+    input: Vec<PathBuf>,
+
+    /// 输出文件（单个输入时）或输出目录
+    #[arg(short, long)]
+    output: PathBuf,
+
+    /// 递归遍历子目录
+    #[arg(short, long)]
+    recursive: bool,
+
+    /// 输出格式。默认 PNG：逆运算的结果再经 JPEG 压缩会白白损失精度
+    #[arg(long, value_enum, default_value_t = FormatArg::Png)]
+    format: FormatArg,
+
+    /// JPEG 质量 1~100（仅 --format jpeg 时有效）
+    #[arg(long, default_value_t = 95)]
+    quality: u8,
+
+    /// 输出文件名后缀
+    #[arg(long, default_value = "")]
+    suffix: String,
+
+    /// 加水印时那张图的原始文件名。
+    ///
+    /// 水印文字里若用过 {filename}，必须靠它还原出当初那段文字 ——
+    /// 否则减掉的是另一段内容，结果反而更糟。
+    #[arg(long, value_name = "NAME")]
+    original_name: Option<String>,
+
+    #[command(flatten)]
+    watermark: args::WatermarkArgs,
+}
+
+#[derive(Args)]
 struct ProbeCmd {
     /// 要查看的素材，省略则只检查 ffmpeg 环境
     #[arg(short, long, num_args = 1..)]
@@ -190,6 +229,7 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
     match cli.command {
         Command::Image(cmd) => run_image(cmd),
         Command::Video(cmd) => run_video(cmd),
+        Command::Remove(cmd) => run_remove(cmd),
         Command::Probe(cmd) => run_probe(cmd),
     }
 }
@@ -337,6 +377,96 @@ fn run_video(cmd: VideoCmd) -> anyhow::Result<ExitCode> {
     }
 
     Ok(exit_code(failed, cmd.input.len()))
+}
+
+fn run_remove(cmd: RemoveCmd) -> anyhow::Result<ExitCode> {
+    let spec = cmd.watermark.to_spec()?;
+    let sources = collect_inputs(&cmd.input, cmd.recursive, IMAGE_EXTENSIONS)?;
+    if sources.is_empty() {
+        bail!("没有找到可处理的图片");
+    }
+
+    let single_file_output = sources.len() == 1 && !is_dir_like(&cmd.output);
+    let extension = cmd.format.extension();
+    let options = ImageOptions {
+        format: cmd.format.to_output(cmd.quality),
+        ..ImageOptions::default()
+    };
+
+    let mut renderer = Renderer::new(Arc::new(FontLibrary::with_system_fonts()));
+    let mut failed = 0usize;
+    let mut worst_unrecoverable = 0f32;
+    let mut mismatched = 0usize;
+
+    for src in &sources {
+        let dst = if single_file_output {
+            cmd.output.clone()
+        } else {
+            batch::output_path(src, &cmd.output, extension, &cmd.suffix)
+        };
+        if let Some(parent) = dst.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            std::fs::create_dir_all(parent)?;
+        }
+
+        // 模板字段必须求值成与当初完全相同的文本，因此优先用 --original-name；
+        // 没给就退回当前文件名（同名时正好对得上）。
+        let name = cmd
+            .original_name
+            .as_deref()
+            .or_else(|| src.file_name().and_then(|n| n.to_str()));
+        let ctx = match name {
+            Some(name) => imprint_core::FieldContext::new().with_file_name(name),
+            None => imprint_core::FieldContext::new(),
+        };
+
+        let outcome = std::fs::File::open(src)
+            .map_err(anyhow::Error::from)
+            .and_then(|input| {
+                let output = std::io::BufWriter::new(std::fs::File::create(&dst)?);
+                Ok(renderer.remove_watermark(input, output, &spec, &options, &ctx)?)
+            });
+
+        match outcome {
+            Ok(report) => {
+                let ratio = report.unrecoverable_ratio();
+                worst_unrecoverable = worst_unrecoverable.max(ratio);
+                if ratio > 0.0 {
+                    eprintln!(
+                        "{}：{:.1}% 的水印像素为完全不透明，无法还原",
+                        src.display(),
+                        ratio * 100.0
+                    );
+                }
+                if report.looks_mismatched() {
+                    mismatched += 1;
+                    eprintln!(
+                        "{}：{:.0}% 的像素越界，水印参数很可能与当初不一致",
+                        src.display(),
+                        report.clamped_ratio() * 100.0
+                    );
+                }
+            }
+            Err(e) => {
+                eprintln!("失败 {}：{e:#}", src.display());
+                failed += 1;
+            }
+        }
+    }
+
+    eprintln!("完成 {}/{}", sources.len() - failed, sources.len());
+    if mismatched > 0 {
+        eprintln!(
+            "\n{mismatched} 个文件疑似参数不匹配。请核对：\n\
+             - 文字、字号、位置、透明度、旋转是否与加水印时完全一致（建议直接用当初的 --preset）\n\
+             - 若用过 {{filename}} 等动态字段，需用 --original-name 指定当初的文件名"
+        );
+    }
+    if worst_unrecoverable > 0.0 {
+        eprintln!("提示：完全不透明的水印会彻底覆盖原像素，这部分信息无法用任何方法还原。");
+    }
+    Ok(exit_code(failed, sources.len()))
 }
 
 fn run_probe(cmd: ProbeCmd) -> anyhow::Result<ExitCode> {

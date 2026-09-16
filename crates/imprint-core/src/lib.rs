@@ -18,6 +18,7 @@ pub mod layer;
 pub mod renderer;
 pub mod spec;
 pub mod text;
+pub mod unblend;
 pub mod video;
 
 // 公开 API 里出现了 tiny_skia 的类型（如 `render_layer` 返回 `Arc<Pixmap>`），
@@ -31,3 +32,4 @@ pub use fonts::{FontBlob, FontLibrary};
 pub use image_job::{Metadata, OutputFormat};
 pub use renderer::{ImageOptions, Renderer};
 pub use spec::WatermarkSpec;
+pub use unblend::{Unblended, unblend};

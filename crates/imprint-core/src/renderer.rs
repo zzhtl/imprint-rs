@@ -150,22 +150,7 @@ impl Renderer {
         size: (u32, u32),
         ctx: &FieldContext,
     ) -> Result<Vec<u8>> {
-        let mut spec = spec.clone();
-        spec.sanitize();
-
-        let layer = self.render_layer(&spec, size, ctx)?;
-        let mut canvas = tiny_skia::Pixmap::new(size.0, size.1).ok_or(Error::InvalidSize {
-            width: size.0,
-            height: size.1,
-        })?;
-        compose::compose(
-            &mut canvas,
-            &layer,
-            &spec.placement,
-            spec.opacity,
-            spec.rotation_deg,
-        )?;
-
+        let canvas = self.build_overlay(spec, size, ctx)?;
         let rgba = pixmap_to_rgba_image(canvas)?;
         let mut png = Vec::new();
         // 必须是 PNG：全画幅图层大部分是透明的，JPEG 没有 alpha 通道。
@@ -213,6 +198,74 @@ impl Renderer {
             progress,
             cancel,
         )
+    }
+
+    /// 渲染一张与目标等尺寸的透明水印图层（premultiplied）。
+    ///
+    /// 视频 overlay 和水印移除都要用它：前者把它编码成 PNG 交给 ffmpeg，
+    /// 后者拿它做逆运算。两者共用同一份渲染路径，才能保证"移除"减掉的
+    /// 正是"添加"当初加上的那一份。
+    fn build_overlay(
+        &mut self,
+        spec: &WatermarkSpec,
+        size: (u32, u32),
+        ctx: &FieldContext,
+    ) -> Result<tiny_skia::Pixmap> {
+        let mut spec = spec.clone();
+        spec.sanitize();
+
+        let layer = self.render_layer(&spec, size, ctx)?;
+        let mut canvas = tiny_skia::Pixmap::new(size.0, size.1).ok_or(Error::InvalidSize {
+            width: size.0,
+            height: size.1,
+        })?;
+        compose::compose(
+            &mut canvas,
+            &layer,
+            &spec.placement,
+            spec.opacity,
+            spec.rotation_deg,
+        )?;
+        Ok(canvas)
+    }
+
+    /// 从带水印的图片中还原原图。
+    ///
+    /// 只适用于**本工具加的水印**：必须提供与当初完全相同的 `spec`（以及会影响
+    /// 模板字段取值的 `ctx`），据此重建同一张水印图层再做逆运算。参数对不上，
+    /// 减掉的就是另一张图，结果只会更糟。
+    ///
+    /// 这是精确逆运算而非修补猜测，但 α = 1 的完全遮挡区域信息已丢失，
+    /// 返回值里会如实给出这类像素的数量。
+    pub fn remove_watermark<R: Read + Seek, W: Write>(
+        &mut self,
+        src: R,
+        dst: W,
+        spec: &WatermarkSpec,
+        options: &ImageOptions,
+        ctx: &FieldContext,
+    ) -> Result<crate::unblend::Unblended> {
+        let decoded = image_job::decode(src, options.max_alloc_bytes)?;
+        let (width, height) = decoded.image.dimensions();
+
+        let ctx =
+            ctx.clone()
+                .with_dimensions(width, height)
+                .with_exif(match &decoded.metadata.exif {
+                    Some(raw) => ExifFields::parse(raw),
+                    None => ExifFields::default(),
+                });
+
+        let overlay = self.build_overlay(spec, (width, height), &ctx)?;
+        let result = crate::unblend::unblend(&decoded.image, &overlay)?;
+
+        let metadata = if options.keep_metadata {
+            decoded.metadata
+        } else {
+            image_job::Metadata::default()
+        };
+        image_job::encode(&result.image, dst, options.format, &metadata)?;
+        Ok(result)
     }
 
     /// [`Self::watermark_image`] 的文件路径版本。
@@ -379,6 +432,130 @@ mod tests {
             p
         };
         assert!(!path.exists(), "临时 overlay 未被清理");
+    }
+
+    #[test]
+    fn watermark_then_remove_restores_the_original() {
+        // 端到端：加水印 -> 移除 -> 与原图比对。走 PNG 以排除 JPEG 压缩的干扰，
+        // 单独验证逆运算本身的精度。
+        let mut r = renderer();
+        let src = RgbaImage::from_fn(300, 200, |x, y| {
+            image::Rgba([(x % 256) as u8, (y % 256) as u8, 140, 255])
+        });
+        let mut src_png = Cursor::new(Vec::new());
+        src.write_to(&mut src_png, image::ImageFormat::Png).unwrap();
+        let src_png = src_png.into_inner();
+
+        let spec = WatermarkSpec {
+            opacity: 0.5,
+            ..text_spec("REMOVE ME")
+        };
+        let opts = ImageOptions {
+            format: OutputFormat::Png,
+            ..ImageOptions::default()
+        };
+
+        let mut marked = Vec::new();
+        r.watermark_image(
+            Cursor::new(&src_png),
+            &mut marked,
+            &spec,
+            &opts,
+            &FieldContext::new(),
+        )
+        .expect("加水印");
+
+        // 确认水印确实改变了画面，否则后面的比对没有意义。
+        let marked_img = image_job::decode(Cursor::new(&marked), None).unwrap().image;
+        assert_ne!(marked_img.as_raw(), src.as_raw(), "水印没有生效");
+
+        let mut restored = Vec::new();
+        let report = r
+            .remove_watermark(
+                Cursor::new(&marked),
+                &mut restored,
+                &spec,
+                &opts,
+                &FieldContext::new(),
+            )
+            .expect("移除水印");
+
+        // 半透明水印不该产生任何不可还原的像素。
+        assert_eq!(report.opaque_pixels, 0, "不该有完全遮挡的像素");
+        assert!(report.recovered_pixels > 0, "没有任何像素被还原");
+
+        let restored_img = image_job::decode(Cursor::new(&restored), None)
+            .unwrap()
+            .image;
+        let mut worst = 0u8;
+        for (a, b) in src.pixels().zip(restored_img.pixels()) {
+            for c in 0..3 {
+                worst = worst.max(a.0[c].abs_diff(b.0[c]));
+            }
+        }
+        assert!(worst <= 3, "还原后与原图的最大通道偏差为 {worst}");
+    }
+
+    #[test]
+    fn removing_with_wrong_spec_does_not_restore() {
+        // 参数对不上就是在减另一张图，结果必然更差 —— 这条也说明该功能
+        // 只对"自己加的、且知道参数"的水印有效。
+        let mut r = renderer();
+        let src = RgbaImage::from_pixel(200, 150, image::Rgba([120, 130, 140, 255]));
+        let mut src_png = Cursor::new(Vec::new());
+        src.write_to(&mut src_png, image::ImageFormat::Png).unwrap();
+        let src_png = src_png.into_inner();
+
+        let opts = ImageOptions {
+            format: OutputFormat::Png,
+            ..ImageOptions::default()
+        };
+        let real = WatermarkSpec {
+            opacity: 0.5,
+            ..text_spec("ORIGINAL")
+        };
+        let mut marked = Vec::new();
+        r.watermark_image(
+            Cursor::new(&src_png),
+            &mut marked,
+            &real,
+            &opts,
+            &FieldContext::new(),
+        )
+        .unwrap();
+
+        let mean_err = |spec: &WatermarkSpec, r: &mut Renderer| -> f32 {
+            let mut out = Vec::new();
+            r.remove_watermark(
+                Cursor::new(&marked),
+                &mut out,
+                spec,
+                &opts,
+                &FieldContext::new(),
+            )
+            .unwrap();
+            let img = image_job::decode(Cursor::new(&out), None).unwrap().image;
+            let mut sum = 0f32;
+            for (a, b) in src.pixels().zip(img.pixels()) {
+                for c in 0..3 {
+                    sum += f32::from(a.0[c].abs_diff(b.0[c]));
+                }
+            }
+            sum / (200.0 * 150.0 * 3.0)
+        };
+
+        let correct = mean_err(&real, &mut r);
+        let wrong = mean_err(
+            &WatermarkSpec {
+                opacity: 0.5,
+                ..text_spec("SOMETHING ELSE ENTIRELY")
+            },
+            &mut r,
+        );
+        assert!(
+            wrong > correct,
+            "用错误的 spec 反而还原得更好？correct={correct} wrong={wrong}"
+        );
     }
 
     #[test]
