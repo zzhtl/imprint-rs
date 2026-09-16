@@ -15,7 +15,7 @@ jobs:
     name: 格式 / lint / 测试
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: 安装 Rust
         run: rustup toolchain install stable --profile minimal --component rustfmt,clippy
@@ -25,8 +25,10 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            libxkbcommon-dev libwayland-dev libxrandr-dev libxi-dev \
-            libxcursor-dev libgl1-mesa-dev
+            libxkbcommon-dev libxkbcommon-x11-dev \
+            libwayland-dev libxrandr-dev libxi-dev libxcursor-dev \
+            libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libxcb1-dev \
+            libgl1-mesa-dev libegl1-mesa-dev libssl-dev
 
       - uses: Swatinem/rust-cache@v2
 
@@ -34,7 +36,16 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: Clippy
-        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+        shell: bash
+        run: |
+          set -o pipefail
+          if ! cargo clippy --workspace --all-targets --all-features -- -D warnings 2>&1 | tee /tmp/clippy.log; then
+            # 仓库日志需要 admin 权限才能下载，annotation 则是公开可读的。
+            grep -E '^error' /tmp/clippy.log | head -8 | while IFS= read -r line; do
+              echo "::error::$line"
+            done
+            exit 1
+          fi
 
       # 视频相关的测试会在检测不到 ffmpeg 时自行跳过，所以这里不编 ffmpeg，保持快速反馈。
       - name: 测试
@@ -60,7 +71,7 @@ jobs:
     name: Android 交叉编译（core）
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: 安装 Rust
         run: |
           rustup toolchain install stable --profile minimal

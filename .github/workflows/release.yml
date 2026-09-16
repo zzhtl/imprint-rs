@@ -32,7 +32,7 @@ jobs:
             archive: zip
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: 安装 Rust
         run: rustup toolchain install stable --profile minimal
@@ -42,9 +42,12 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
+          sudo apt-get install -y --no-install-recommends nasm
           sudo apt-get install -y --no-install-recommends \
-            nasm libxkbcommon-dev libwayland-dev libxrandr-dev libxi-dev \
-            libxcursor-dev libgl1-mesa-dev
+            libxkbcommon-dev libxkbcommon-x11-dev \
+            libwayland-dev libxrandr-dev libxi-dev libxcursor-dev \
+            libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libxcb1-dev \
+            libgl1-mesa-dev libegl1-mesa-dev libssl-dev
 
       - name: 安装汇编器（macOS）
         if: runner.os == 'macOS'
