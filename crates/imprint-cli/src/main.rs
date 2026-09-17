@@ -48,6 +48,8 @@ enum Command {
     Video(VideoCmd),
     /// 从图片中移除本工具添加的水印（需提供当初的参数）
     Remove(RemoveCmd),
+    /// 修补图片的指定区域，用周围像素覆盖掉污点、日期戳或水印
+    Erase(EraseCmd),
     /// 嵌入肉眼不可见的盲水印，用于事后溯源
     Sign(SignCmd),
     /// 从图片中提取盲水印
@@ -196,6 +198,93 @@ struct RemoveCmd {
     watermark: args::WatermarkArgs,
 }
 
+/// 修补指定区域。
+///
+/// 与 `remove` 是两件事：`remove` 知道当初的水印参数，做的是精确逆运算；
+/// 这里什么都不知道，只能拿周围的像素猜中间该是什么，结果是**近似**的。
+#[derive(Args)]
+struct EraseCmd {
+    /// 输入文件或目录，可给多个
+    #[arg(short, long, required = true, num_args = 1..)]
+    input: Vec<PathBuf>,
+
+    /// 输出文件（单个输入时）或输出目录
+    #[arg(short, long)]
+    output: PathBuf,
+
+    /// 要修补的矩形，格式 `x,y,宽,高`（像素）。可重复给多个。
+    ///
+    /// 单独使用时整个框都会被周围像素糊掉，只适合小面积；框一旦大到几百像素见方，糊出来的结果会比留着水印更难看，此时务必配 --color。
+    #[arg(long, value_name = "X,Y,W,H", value_parser = parse_region)]
+    region: Vec<imprint_core::inpaint::Rect>,
+
+    /// 蒙版图片：白色处需要修补。尺寸须与原图一致
+    #[arg(long, value_name = "FILE")]
+    mask: Option<PathBuf>,
+
+    /// 蒙版图的亮度阈值，高于它才算需要修补
+    #[arg(long, default_value_t = 128)]
+    mask_threshold: u8,
+
+    /// 只修补接近该颜色的像素，如 `#FFFFFF`。
+    ///
+    /// 与 --region 连用是最有效的组合：框缩到水印附近，再把框里真正属于水印的笔画挑出来，框内的背景就不会被一起糊掉。
+    #[arg(long, value_name = "HEX")]
+    color: Option<String>,
+
+    /// --color 的容差：三通道差值之和的上限，取值 0~765。
+    ///
+    /// 半透明水印与背景混过色，低于 180 基本选不中；不透明水印几十就够。200 对两者都接近最优，再往上会开始误伤背景。
+    #[arg(long, default_value_t = 200)]
+    tolerance: u16,
+
+    /// 把选区向外扩张的像素数，用来盖住水印抗锯齿的边缘
+    #[arg(long, default_value_t = 2)]
+    grow: u32,
+
+    /// 采样半径。越大越平滑也越糊；文字类水印 3~6 合适
+    #[arg(long, default_value_t = imprint_core::inpaint::DEFAULT_RADIUS)]
+    radius: u32,
+
+    /// 递归遍历子目录
+    #[arg(short, long)]
+    recursive: bool,
+
+    /// 输出格式
+    #[arg(long, value_enum, default_value_t = FormatArg::Png)]
+    format: FormatArg,
+
+    /// JPEG 质量 1~100（仅 --format jpeg 时有效）
+    #[arg(long, default_value_t = 95)]
+    quality: u8,
+
+    /// 输出文件名后缀
+    #[arg(long, default_value = "")]
+    suffix: String,
+}
+
+/// 解析 `x,y,宽,高`。x/y 允许为负，方便圈住跨出画布边缘的水印。
+fn parse_region(s: &str) -> anyhow::Result<imprint_core::inpaint::Rect> {
+    let parts: Vec<&str> = s.split(',').map(str::trim).collect();
+    let [x, y, w, h] = parts.as_slice() else {
+        bail!("区域应为 `x,y,宽,高` 四个数字，得到 `{s}`");
+    };
+    let num = |v: &str, name: &str| -> anyhow::Result<i64> {
+        v.parse::<i64>()
+            .with_context(|| format!("区域 `{s}` 的{name}不是整数"))
+    };
+    let (width, height) = (num(w, "宽")?, num(h, "高")?);
+    if width <= 0 || height <= 0 {
+        bail!("区域 `{s}` 的宽高必须为正");
+    }
+    Ok(imprint_core::inpaint::Rect {
+        x: num(x, "x")?,
+        y: num(y, "y")?,
+        width: width as u32,
+        height: height as u32,
+    })
+}
+
 #[derive(Args)]
 struct SignCmd {
     /// 输入文件或目录，可给多个
@@ -301,6 +390,7 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
         Command::Image(cmd) => run_image(cmd),
         Command::Video(cmd) => run_video(cmd),
         Command::Remove(cmd) => run_remove(cmd),
+        Command::Erase(cmd) => run_erase(cmd),
         Command::Sign(cmd) => run_sign(cmd),
         Command::Verify(cmd) => run_verify(cmd),
         Command::Probe(cmd) => run_probe(cmd),
@@ -539,6 +629,83 @@ fn run_remove(cmd: RemoveCmd) -> anyhow::Result<ExitCode> {
     if worst_unrecoverable > 0.0 {
         eprintln!("提示：完全不透明的水印会彻底覆盖原像素，这部分信息无法用任何方法还原。");
     }
+    Ok(exit_code(failed, sources.len()))
+}
+
+fn run_erase(cmd: EraseCmd) -> anyhow::Result<ExitCode> {
+    let mut mask_spec = imprint_core::inpaint::MaskSpec {
+        rects: cmd.region.clone(),
+        grow: cmd.grow,
+        ..Default::default()
+    };
+    if let Some(path) = &cmd.mask {
+        let file = std::fs::File::open(path)
+            .with_context(|| format!("打开蒙版 {} 失败", path.display()))?;
+        let img = imprint_core::image_job::decode(file, ImageOptions::default().max_alloc_bytes)
+            .with_context(|| format!("解码蒙版 {} 失败", path.display()))?;
+        mask_spec.mask_image = Some((img.image, cmd.mask_threshold));
+    }
+    if let Some(hex) = &cmd.color {
+        let c = args::parse_color(hex)?;
+        mask_spec.color_key = Some(imprint_core::inpaint::ColorKey {
+            color: [c.r, c.g, c.b],
+            tolerance: cmd.tolerance,
+        });
+    }
+    if mask_spec.is_empty() {
+        bail!("没有指定要修补的范围：请给 --region、--mask 或 --color 中的至少一个");
+    }
+
+    let sources = collect_inputs(&cmd.input, cmd.recursive, IMAGE_EXTENSIONS)?;
+    if sources.is_empty() {
+        bail!("没有找到可处理的图片");
+    }
+
+    let single_file_output = sources.len() == 1 && !is_dir_like(&cmd.output);
+    let extension = cmd.format.extension();
+    let options = ImageOptions {
+        format: cmd.format.to_output(cmd.quality),
+        ..ImageOptions::default()
+    };
+
+    let mut failed = 0usize;
+    for src in &sources {
+        let dst = if single_file_output {
+            cmd.output.clone()
+        } else {
+            batch::output_path(src, &cmd.output, extension, &cmd.suffix)
+        };
+        if let Some(parent) = dst.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            std::fs::create_dir_all(parent)?;
+        }
+
+        let outcome = std::fs::File::open(src)
+            .map_err(anyhow::Error::from)
+            .and_then(|input| {
+                let output = std::io::BufWriter::new(std::fs::File::create(&dst)?);
+                Ok(imprint_core::inpaint::erase(
+                    input, output, &mask_spec, cmd.radius, &options,
+                )?)
+            });
+
+        match outcome {
+            Ok(report) if report.filled_pixels == 0 => {
+                // 写出的是原样复制，用户多半会以为没生效，直说比让他自己猜好。
+                eprintln!("{}：选区没有命中任何像素，输出与原图一致", src.display());
+            }
+            Ok(report) => {
+                log::info!("{}：修补了 {} 个像素", src.display(), report.filled_pixels);
+            }
+            Err(e) => {
+                eprintln!("失败 {}：{e:#}", src.display());
+                failed += 1;
+            }
+        }
+    }
+
+    eprintln!("完成 {}/{}", sources.len() - failed, sources.len());
     Ok(exit_code(failed, sources.len()))
 }
 

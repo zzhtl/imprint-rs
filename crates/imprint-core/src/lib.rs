@@ -15,6 +15,7 @@ pub mod error;
 pub mod fields;
 pub mod fonts;
 pub mod image_job;
+pub mod inpaint;
 pub mod layer;
 pub mod renderer;
 pub mod spec;
