@@ -48,8 +48,33 @@ enum Command {
     Video(VideoCmd),
     /// 从图片中移除本工具添加的水印（需提供当初的参数）
     Remove(RemoveCmd),
+    /// 嵌入肉眼不可见的盲水印，用于事后溯源
+    Sign(SignCmd),
+    /// 从图片中提取盲水印
+    Verify(VerifyCmd),
     /// 查看素材信息与 ffmpeg 可用性
     Probe(ProbeCmd),
+}
+
+#[derive(Copy, Clone, PartialEq, Eq, ValueEnum)]
+enum StrengthArg {
+    /// 几乎不可能被看出，但只扛得住轻度压缩
+    Subtle,
+    /// 默认：JPEG 质量 75 以上可靠提取，且肉眼无差别
+    Default,
+    /// 能扛质量 60 的压缩，平坦区域可能有轻微块状痕迹
+    Robust,
+}
+
+impl StrengthArg {
+    fn to_strength(self) -> imprint_core::blind::Strength {
+        use imprint_core::blind::Strength;
+        match self {
+            Self::Subtle => Strength::SUBTLE,
+            Self::Default => Strength::DEFAULT,
+            Self::Robust => Strength::ROBUST,
+        }
+    }
 }
 
 #[derive(Args)]
@@ -172,6 +197,52 @@ struct RemoveCmd {
 }
 
 #[derive(Args)]
+struct SignCmd {
+    /// 输入文件或目录，可给多个
+    #[arg(short, long, required = true, num_args = 1..)]
+    input: Vec<PathBuf>,
+
+    /// 输出文件（单个输入时）或输出目录
+    #[arg(short, long)]
+    output: PathBuf,
+
+    /// 要嵌入的标识，如工号、邮箱或订单号
+    #[arg(short, long, value_name = "TEXT")]
+    payload: String,
+
+    /// 递归遍历子目录
+    #[arg(short, long)]
+    recursive: bool,
+
+    /// 嵌入强度
+    #[arg(long, value_enum, default_value_t = StrengthArg::Default)]
+    strength: StrengthArg,
+
+    /// 输出格式
+    #[arg(long, value_enum, default_value_t = FormatArg::Jpeg)]
+    format: FormatArg,
+
+    /// JPEG 质量。低于 75 会明显削弱盲水印的可提取性
+    #[arg(long, default_value_t = 95)]
+    quality: u8,
+
+    /// 输出文件名后缀
+    #[arg(long, default_value = "")]
+    suffix: String,
+}
+
+#[derive(Args)]
+struct VerifyCmd {
+    /// 待检验的图片，可给多个
+    #[arg(short, long, required = true, num_args = 1..)]
+    input: Vec<PathBuf>,
+
+    /// 递归遍历子目录
+    #[arg(short, long)]
+    recursive: bool,
+}
+
+#[derive(Args)]
 struct ProbeCmd {
     /// 要查看的素材，省略则只检查 ffmpeg 环境
     #[arg(short, long, num_args = 1..)]
@@ -230,6 +301,8 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
         Command::Image(cmd) => run_image(cmd),
         Command::Video(cmd) => run_video(cmd),
         Command::Remove(cmd) => run_remove(cmd),
+        Command::Sign(cmd) => run_sign(cmd),
+        Command::Verify(cmd) => run_verify(cmd),
         Command::Probe(cmd) => run_probe(cmd),
     }
 }
@@ -467,6 +540,94 @@ fn run_remove(cmd: RemoveCmd) -> anyhow::Result<ExitCode> {
         eprintln!("提示：完全不透明的水印会彻底覆盖原像素，这部分信息无法用任何方法还原。");
     }
     Ok(exit_code(failed, sources.len()))
+}
+
+fn run_sign(cmd: SignCmd) -> anyhow::Result<ExitCode> {
+    let sources = collect_inputs(&cmd.input, cmd.recursive, IMAGE_EXTENSIONS)?;
+    if sources.is_empty() {
+        bail!("没有找到可处理的图片");
+    }
+    if matches!(cmd.format, FormatArg::Jpeg) && cmd.quality < 75 {
+        eprintln!(
+            "警告：JPEG 质量 {} 低于 75，盲水印可能无法可靠提取",
+            cmd.quality
+        );
+    }
+
+    let single_file_output = sources.len() == 1 && !is_dir_like(&cmd.output);
+    let extension = cmd.format.extension();
+    let options = ImageOptions {
+        format: cmd.format.to_output(cmd.quality),
+        ..ImageOptions::default()
+    };
+    let strength = cmd.strength.to_strength();
+    let mut failed = 0usize;
+
+    for src in &sources {
+        let dst = if single_file_output {
+            cmd.output.clone()
+        } else {
+            batch::output_path(src, &cmd.output, extension, &cmd.suffix)
+        };
+        if let Some(parent) = dst.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            std::fs::create_dir_all(parent)?;
+        }
+
+        let outcome = (|| -> anyhow::Result<()> {
+            let decoded = imprint_core::image_job::decode(
+                std::fs::File::open(src)?,
+                options.max_alloc_bytes,
+            )?;
+            let signed =
+                imprint_core::blind::embed(&decoded.image, cmd.payload.as_bytes(), strength)?;
+            let out = std::io::BufWriter::new(std::fs::File::create(&dst)?);
+            imprint_core::image_job::encode(&signed, out, options.format, &decoded.metadata)?;
+            Ok(())
+        })();
+
+        if let Err(e) = outcome {
+            eprintln!("失败 {}：{e:#}", src.display());
+            failed += 1;
+        }
+    }
+
+    eprintln!("完成 {}/{}", sources.len() - failed, sources.len());
+    Ok(exit_code(failed, sources.len()))
+}
+
+fn run_verify(cmd: VerifyCmd) -> anyhow::Result<ExitCode> {
+    let sources = collect_inputs(&cmd.input, cmd.recursive, IMAGE_EXTENSIONS)?;
+    if sources.is_empty() {
+        bail!("没有找到可检验的图片");
+    }
+
+    let mut found = 0usize;
+    for src in &sources {
+        match std::fs::File::open(src)
+            .map_err(anyhow::Error::from)
+            .and_then(|f| Ok(imprint_core::image_job::decode(f, None)?))
+        {
+            Ok(decoded) => match imprint_core::blind::extract(&decoded.image) {
+                Some(payload) => {
+                    found += 1;
+                    let text = String::from_utf8_lossy(&payload);
+                    println!("{}\t{}", src.display(), text);
+                }
+                None => println!("{}\t(未检出)", src.display()),
+            },
+            Err(e) => eprintln!("读取失败 {}：{e:#}", src.display()),
+        }
+    }
+
+    eprintln!("检出 {found}/{}", sources.len());
+    // 一个都没检出时给出非零退出码，便于脚本判断。
+    Ok(if found == 0 {
+        ExitCode::from(1)
+    } else {
+        ExitCode::SUCCESS
+    })
 }
 
 fn run_probe(cmd: ProbeCmd) -> anyhow::Result<ExitCode> {

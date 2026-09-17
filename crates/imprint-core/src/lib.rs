@@ -8,6 +8,7 @@
 //!    Android 的文件选择返回 `content://` URI，根本没有文件系统路径可用。
 
 pub mod batch;
+pub mod blind;
 pub mod compose;
 pub mod convert;
 pub mod error;

@@ -30,6 +30,7 @@ macOS 仅提供 Apple Silicon（M 系列）版本，不支持 Intel 机型。
 - **批量并行**：多核并行处理，失败项不中断整批
 - **元数据保留**：EXIF / ICC 原样搬运，自动处理手机照片的方向标记
 - **可撤销**：给定当初的参数，可通过精确逆运算还原原图（半透明水印实测 59 dB）
+- **盲水印溯源**：嵌入肉眼不可见的标识，可见水印被抹掉后仍能提取（实测抗 JPEG 压缩与右下裁剪）
 
 ## 快速开始
 
@@ -51,6 +52,13 @@ imprint image -i ./photos -o ./out --recursive \
 
 ```bash
 imprint video -i clip.mp4 -o clip_wm.mp4 --text "水印 {date}" --position br
+```
+
+嵌入不可见的盲水印，并在外泄后溯源：
+
+```bash
+imprint sign   -i photo.jpg -o signed.jpg --payload "emp-8891@company"
+imprint verify -i leaked.jpg
 ```
 
 检查环境（ffmpeg 位置、可用编码器、中文字体）：
@@ -131,6 +139,66 @@ imprint remove -i marked.png -o restored.png --preset my-style.json --original-n
 
 > 需要说明：这个功能针对的是「自己加错了要重来」这类场景。它做不到去除任意图片上
 > 别人的水印——那需要 AI 修复，不在本工具范围内。
+
+### `imprint sign` / `imprint verify`
+
+嵌入与提取**盲水印**——肉眼不可见的标识，用于事后溯源。
+
+```bash
+# 发布前：嵌入领取人标识
+imprint sign -i photo.jpg -o photo_signed.jpg --payload "emp-8891@company"
+
+# 发现外泄时：从可疑图片中提取
+imprint verify -i leaked.jpg
+# leaked.jpg    emp-8891@company
+```
+
+它解决的不是"阻止别人去掉水印"——可见水印终究能被裁掉或用 AI 抹平。它解决的是
+**抹掉之后仍能溯源**：即使可见水印没了、图片被重新压缩，仍能提取出当初嵌入的标识。
+
+原理是在 8×8 块的 DCT **中频**系数上做 QIM 量化调制。选中频是因为低频改动会肉眼可见，
+高频会被 JPEG 的量化表直接抹平。载荷反复写满整张图，提取时对每个 bit 的多份副本
+做多数表决，因而能容忍局部损坏。
+
+| 参数 | 说明 |
+| --- | --- |
+| `-p, --payload <TEXT>` | 要嵌入的标识，最长 64 字节 |
+| `--strength <LEVEL>` | `subtle` / `default` / `robust`，见下表 |
+| `--format` `--quality` | 输出格式；JPEG 质量低于 75 会警告 |
+
+#### 实测鲁棒性
+
+以下是在 1600×1000 图上用默认强度的实测结果：
+
+| 攻击方式 | 结果 |
+| --- | --- |
+| JPEG 重压缩（质量 50~95） | ✅ 可提取 |
+| JPEG 质量 40 | ❌ 失败（需 `--strength robust`） |
+| 移除可见水印（`imprint remove`） | ✅ 可提取 |
+| 裁剪右侧 / 底部 / 右下角（任意像素） | ✅ 可提取 |
+| 涂抹局部区域 | ✅ 可提取 |
+| **裁剪左侧 / 顶部** | ❌ 失败 |
+| **缩放** | ❌ 失败 |
+| **旋转** | ❌ 失败 |
+
+裁剪右下能扛、裁剪左上不能，是因为 bit 槽位按块坐标计算：只要图像左上角原点没动，
+槽位就不会错位。抗原点平移需要搜索同步偏移，本实现没有做。
+
+| 强度 | 适用场景 |
+| --- | --- |
+| `subtle` | 几乎不可能被看出，只扛得住轻度压缩 |
+| `default` | JPEG 质量 75 以上可靠提取，肉眼无差别（PSNR > 38 dB） |
+| `robust` | 能扛质量 60 的压缩，平坦区域可能有轻微块状痕迹 |
+
+> **不要指望它抗 AI 重绘**：用生成式模型重画一遍图像，等于重新生成了像素，
+> 任何频域水印都不复存在。这是原理性的，不是实现缺陷。
+
+推荐用法：**可见水印用于威慑，盲水印用于追责**，两者叠加。
+
+```bash
+imprint sign  -i raw.jpg    -o signed.jpg   --payload "emp-8891"
+imprint image -i signed.jpg -o publish.jpg  --text "机密 · 仅限内部" --tile --opacity 0.25
+```
 
 ### `imprint probe`
 
