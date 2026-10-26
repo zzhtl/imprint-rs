@@ -17,6 +17,9 @@
 
 macOS 仅提供 Apple Silicon（M 系列）版本，不支持 Intel 机型。
 
+从 v0.3.1 起，Linux 发行包固定在 Ubuntu 22.04 构建，面向 glibc 2.35 及以上系统。
+v0.3.0 的 Linux 包依赖 glibc 2.43，较旧系统请使用 v0.3.1 或更新版本。
+
 包内含 `imprint`、`imprint-ui` 和一个裁剪版 `ffmpeg`（约 7.5 MB）。**三者必须放在同一目录**——程序按「可执行文件同目录 → PATH」的顺序查找 ffmpeg。
 
 ## 特性

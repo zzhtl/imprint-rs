@@ -19,7 +19,8 @@ jobs:
       matrix:
         include:
           - name: linux-x86_64
-            os: ubuntu-latest
+            # 固定发行包的 glibc 基线，避免 latest 升级后旧系统无法启动。
+            os: ubuntu-22.04
             archive: tar.gz
           # macOS 只发 Apple Silicon：Intel 机型已在退场，而 macos-13 的
           # Intel runner 在 GitHub 上极其紧缺，实测连续两轮都排不到，
@@ -72,6 +73,8 @@ jobs:
             git
 
       - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.os }}
 
       # ffmpeg 一次要编好几分钟，配置没变就直接复用上一次的产物。
       - name: 缓存 ffmpeg 产物
@@ -79,7 +82,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: dist
-          key: ffmpeg-${{ matrix.name }}-${{ hashFiles('xtask/src/ffmpeg.rs') }}
+          key: ffmpeg-${{ matrix.os }}-${{ matrix.name }}-${{ hashFiles('xtask/src/ffmpeg.rs') }}
 
       - name: 构建裁剪版 ffmpeg（非 Windows）
         if: runner.os != 'Windows' && steps.ffmpeg-cache.outputs.cache-hit != 'true'
@@ -204,6 +207,8 @@ jobs:
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@v5
+
       - uses: actions/download-artifact@v4
         with:
           path: artifacts
@@ -232,8 +237,10 @@ jobs:
             本包内置 FFmpeg（LGPL v2.1）与 OpenH264（BSD），未启用 x264/x265 等 GPL 组件。
             详见包内 `THIRD_PARTY_NOTICES.txt`。
         run: |
+          cat .github/release-notes.md > release-notes.txt
+          printf '\n%s\n' "$NOTES" >> release-notes.txt
           gh release create "${GITHUB_REF_NAME}" \
             --repo "${GITHUB_REPOSITORY}" \
             --title "imprint ${GITHUB_REF_NAME}" \
-            --notes "$NOTES" \
+            --notes-file release-notes.txt \
             artifacts/*
