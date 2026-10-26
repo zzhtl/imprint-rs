@@ -26,6 +26,9 @@ pub enum Error {
     #[error("IO 失败")]
     Io(#[from] std::io::Error),
 
+    #[error("输出路径冲突：{0}")]
+    OutputConflict(String),
+
     /// 画布或水印尺寸为 0，或超出 `tiny_skia::Pixmap` 能分配的上限。
     #[error("无效的画布尺寸 {width}x{height}")]
     InvalidSize { width: u32, height: u32 },

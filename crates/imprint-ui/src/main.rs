@@ -6,6 +6,7 @@ mod app;
 mod fonts;
 mod job;
 mod preview;
+mod theme;
 
 use app::ImprintApp;
 
@@ -14,9 +15,9 @@ fn main() -> eframe::Result {
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1280.0, 820.0])
-            .with_min_inner_size([900.0, 600.0])
-            .with_title("imprint · 图片视频水印"),
+            .with_inner_size([1360.0, 880.0])
+            .with_min_inner_size([1000.0, 680.0])
+            .with_title("imprint · 水印工作室"),
         ..Default::default()
     };
 

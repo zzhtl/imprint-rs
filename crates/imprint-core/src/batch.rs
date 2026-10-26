@@ -7,6 +7,7 @@
 //! 错误随结果一起返回，由调用方决定怎么呈现。
 
 use std::{
+    collections::HashSet,
     path::{Path, PathBuf},
     sync::{
         Arc,
@@ -95,45 +96,121 @@ where
     F: Fn(BatchProgress) + Sync,
 {
     let total = items.len();
+    if let Err(e) = validate_output_paths(items) {
+        let message = e.to_string();
+        on_progress(BatchProgress {
+            completed: total,
+            failed: total,
+            total,
+        });
+        return items
+            .iter()
+            .map(|item| ItemOutcome {
+                src: item.src.clone(),
+                dst: item.dst.clone(),
+                result: Err(Error::OutputConflict(message.clone())),
+            })
+            .collect();
+    }
     let completed = AtomicUsize::new(0);
     let failed = AtomicUsize::new(0);
 
     let mut spec = spec.clone();
     spec.sanitize();
 
+    // 固定数量的分块各持一个 Renderer，避免 map_init 随调度拆分反复初始化。
+    // 按每像素约 12 字节估算合成与编码缓冲，限制并发缓冲预算为 512 MiB。
+    let largest = items
+        .iter()
+        .filter_map(|item| {
+            std::fs::File::open(&item.src)
+                .ok()
+                .and_then(|f| crate::image_job::probe_dimensions(f).ok())
+                .map(|(w, h)| u64::from(w) * u64::from(h))
+        })
+        .max()
+        .unwrap_or(0);
+    let memory_workers = (512 * 1024 * 1024 / largest.saturating_mul(12).max(1)).max(1) as usize;
+    let workers = rayon::current_num_threads().min(memory_workers);
+    let chunk_size = items.len().div_ceil(workers).max(1);
     items
-        .par_iter()
-        // 每线程建一次 Renderer：构造要克隆字体库，不能按条目建。
-        .map_init(
-            || Renderer::new(Arc::clone(&fonts)),
-            |renderer, item| {
-                if cancel.is_cancelled() {
-                    return ItemOutcome {
+        .par_chunks(chunk_size)
+        .flat_map_iter(|chunk| {
+            let mut renderer = Renderer::new(Arc::clone(&fonts));
+            chunk
+                .iter()
+                .map(|item| {
+                    if cancel.is_cancelled() {
+                        return ItemOutcome {
+                            src: item.src.clone(),
+                            dst: item.dst.clone(),
+                            result: Err(Error::Cancelled),
+                        };
+                    }
+
+                    let result = process_one(&mut renderer, item, &spec, options);
+                    if result.is_err() {
+                        failed.fetch_add(1, Ordering::Relaxed);
+                    }
+                    let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
+                    on_progress(BatchProgress {
+                        completed: done,
+                        failed: failed.load(Ordering::Relaxed),
+                        total,
+                    });
+
+                    ItemOutcome {
                         src: item.src.clone(),
                         dst: item.dst.clone(),
-                        result: Err(Error::Cancelled),
-                    };
-                }
-
-                let result = process_one(renderer, item, &spec, options);
-                if result.is_err() {
-                    failed.fetch_add(1, Ordering::Relaxed);
-                }
-                let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
-                on_progress(BatchProgress {
-                    completed: done,
-                    failed: failed.load(Ordering::Relaxed),
-                    total,
-                });
-
-                ItemOutcome {
-                    src: item.src.clone(),
-                    dst: item.dst.clone(),
-                    result,
-                }
-            },
-        )
+                        result,
+                    }
+                })
+                .collect::<Vec<_>>()
+        })
         .collect()
+}
+
+/// 在写入前检查重名目标以及会覆盖本批其他输入的目标。
+pub fn validate_output_paths(items: &[BatchItem]) -> Result<()> {
+    let sources: HashSet<PathBuf> = items
+        .iter()
+        .map(|i| resolved_path(&i.src))
+        .collect::<Result<_>>()?;
+    let mut destinations = HashSet::new();
+    for item in items {
+        let dst = resolved_path(&item.dst)?;
+        if !destinations.insert(dst.clone())
+            || (sources.contains(&dst) && dst != resolved_path(&item.src)?)
+        {
+            return Err(Error::OutputConflict(item.dst.display().to_string()));
+        }
+    }
+    Ok(())
+}
+
+fn resolved_path(path: &Path) -> Result<PathBuf> {
+    let mut base = std::path::absolute(path)?;
+    let mut missing = Vec::new();
+    loop {
+        match base.canonicalize() {
+            Ok(existing) => {
+                base = existing;
+                break;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                let Some(name) = base.file_name() else {
+                    return Err(e.into());
+                };
+                missing.push(name.to_os_string());
+                base.pop();
+            }
+            Err(e) => return Err(e.into()),
+        }
+    }
+    for name in missing.into_iter().rev() {
+        base.push(name);
+    }
+    Ok(base)
 }
 
 fn process_one(
@@ -296,17 +373,23 @@ mod tests {
 
         let cancel = CancelToken::new();
         // 第一条完成就取消，后续应当迅速以 Cancelled 收尾。
-        let outcomes = run_image_batch(
-            Arc::new(FontLibrary::with_system_fonts()),
-            &items,
-            &spec(),
-            &ImageOptions {
-                format: OutputFormat::Png,
-                ..ImageOptions::default()
-            },
-            &cancel,
-            |_| cancel.cancel(),
-        );
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(2)
+            .build()
+            .unwrap();
+        let outcomes = pool.install(|| {
+            run_image_batch(
+                Arc::new(FontLibrary::with_system_fonts()),
+                &items,
+                &spec(),
+                &ImageOptions {
+                    format: OutputFormat::Png,
+                    ..ImageOptions::default()
+                },
+                &cancel,
+                |_| cancel.cancel(),
+            )
+        });
 
         assert_eq!(outcomes.len(), 16, "每条都要有结果，取消也不例外");
         assert!(

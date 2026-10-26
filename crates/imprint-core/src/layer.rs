@@ -106,9 +106,118 @@ fn text_layer(
         });
     }
 
-    let layer = text::rasterize(font_system, swash_cache, &resolved, &style_at(font_size))?;
+    let mut style = style_at(font_size);
+    let effects = text_spec.stroke.is_some() || text_spec.shadow.is_some();
+    if effects {
+        style.color.a = 255;
+    }
+    let layer = text::rasterize(font_system, swash_cache, &resolved, &style)?;
     check_layer_size(layer.width(), layer.height())?;
-    Ok(layer)
+    if effects {
+        text_effects(layer, text_spec, font_size)
+    } else {
+        Ok(layer)
+    }
+}
+
+fn text_effects(layer: Pixmap, spec: &TextSpec, font_size: f32) -> Result<Pixmap> {
+    let radius = spec.stroke.as_ref().map_or(0, |s| {
+        (s.width_ratio.clamp(0.0, 0.5) * font_size).ceil() as i32
+    });
+    let (dx, dy) = spec.shadow.as_ref().map_or((0, 0), |s| {
+        (
+            (s.offset_ratio.0.clamp(-1.0, 1.0) * font_size).round() as i32,
+            (s.offset_ratio.1.clamp(-1.0, 1.0) * font_size).round() as i32,
+        )
+    });
+    let left = (-radius).min(dx).min(0);
+    let top = (-radius).min(dy).min(0);
+    let width = (layer.width() as i32 + radius.max(dx).max(0) - left) as u32;
+    let height = (layer.height() as i32 + radius.max(dy).max(0) - top) as u32;
+    check_layer_size(width, height)?;
+    let mut out = Pixmap::new(width, height).ok_or(Error::InvalidSize { width, height })?;
+    let mut mask =
+        tiny_skia::Mask::new(width, height).ok_or(Error::InvalidSize { width, height })?;
+    let put_alpha = |mask: &mut tiny_skia::Mask, x: i32, y: i32| {
+        mask.data_mut().fill(0);
+        for (row, pixels) in layer.pixels().chunks(layer.width() as usize).enumerate() {
+            let offset = (row + y as usize) * width as usize + x as usize;
+            for (dst, src) in mask.data_mut()[offset..].iter_mut().zip(pixels) {
+                *dst = src.alpha();
+            }
+        }
+    };
+    let paint_mask = |out: &mut Pixmap, mask: &tiny_skia::Mask, color: crate::spec::Rgba8| {
+        let mut paint = tiny_skia::Paint::default();
+        paint.set_color_rgba8(color.r, color.g, color.b, color.a);
+        if let Some(rect) = tiny_skia::Rect::from_xywh(0.0, 0.0, width as f32, height as f32) {
+            out.fill_rect(rect, &paint, Transform::identity(), Some(mask));
+        }
+    };
+    if let Some(shadow) = &spec.shadow {
+        put_alpha(&mut mask, dx - left, dy - top);
+        paint_mask(&mut out, &mask, shadow.color);
+    }
+    if let Some(stroke) = &spec.stroke
+        && radius > 0
+    {
+        put_alpha(&mut mask, -left, -top);
+        dilate_alpha(
+            mask.data_mut(),
+            width as usize,
+            height as usize,
+            radius as usize,
+        );
+        paint_mask(&mut out, &mask, stroke.color);
+    }
+    out.draw_pixmap(
+        -left,
+        -top,
+        layer.as_ref(),
+        &PixmapPaint {
+            opacity: spec.color.a as f32 / 255.0,
+            ..Default::default()
+        },
+        Transform::identity(),
+        None,
+    );
+    Ok(out)
+}
+
+/// 两次滑动窗口最大值，描边成本与像素数成正比，不随半径平方增长。
+fn dilate_alpha(data: &mut [u8], width: usize, height: usize, radius: usize) {
+    fn line(src: &[u8], dst: &mut [u8], radius: usize) {
+        let mut queue = std::collections::VecDeque::<usize>::new();
+        let mut end = 0;
+        for (i, value) in dst.iter_mut().enumerate() {
+            while end < (i + radius + 1).min(src.len()) {
+                while queue.back().is_some_and(|&j| src[j] <= src[end]) {
+                    queue.pop_back();
+                }
+                queue.push_back(end);
+                end += 1;
+            }
+            while queue.front().is_some_and(|&j| j < i.saturating_sub(radius)) {
+                queue.pop_front();
+            }
+            *value = queue.front().map_or(0, |&j| src[j]);
+        }
+    }
+    let source = data.to_vec();
+    for (src, dst) in source.chunks(width).zip(data.chunks_mut(width)) {
+        line(src, dst, radius);
+    }
+    let mut column = vec![0; height];
+    let mut expanded = vec![0; height];
+    for x in 0..width {
+        for y in 0..height {
+            column[y] = data[y * width + x];
+        }
+        line(&column, &mut expanded, radius);
+        for y in 0..height {
+            data[y * width + x] = expanded[y];
+        }
+    }
 }
 
 /// 反解出能让文本排版宽度达到 `want_width` 的字号。

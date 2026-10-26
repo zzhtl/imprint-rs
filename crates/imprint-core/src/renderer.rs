@@ -6,7 +6,7 @@
 
 use std::{
     fs::File,
-    io::{BufWriter, Read, Seek, Write},
+    io::{Read, Seek, Write},
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -23,7 +23,7 @@ use crate::{
     fonts::FontLibrary,
     image_job::{self, OutputFormat},
     layer,
-    spec::WatermarkSpec,
+    spec::{Content, SizeMode, WatermarkSpec},
     video::{EncodeSettings, VideoJob, VideoPipeline, VideoProgress},
 };
 
@@ -54,6 +54,15 @@ pub struct Renderer {
     fonts: Arc<FontLibrary>,
     font_system: FontSystem,
     swash_cache: SwashCache,
+    cached_layer: Option<LayerCache>,
+}
+
+struct LayerCache {
+    content: Content,
+    size: SizeMode,
+    target: (u32, u32),
+    resolved_text: String,
+    pixels: Arc<Pixmap>,
 }
 
 impl Renderer {
@@ -66,11 +75,41 @@ impl Renderer {
             fonts,
             font_system,
             swash_cache: SwashCache::new(),
+            cached_layer: None,
         }
     }
 
     pub fn fonts(&self) -> &FontLibrary {
         &self.fonts
+    }
+
+    fn cached_layer(
+        &mut self,
+        spec: &WatermarkSpec,
+        target: (u32, u32),
+        ctx: &FieldContext,
+    ) -> Result<Arc<Pixmap>> {
+        let resolved_text = match &spec.content {
+            Content::Text(t) => crate::fields::render(&t.template, ctx),
+            Content::Image(_) => String::new(),
+        };
+        if let Some(cache) = &self.cached_layer
+            && cache.content == spec.content
+            && cache.size == spec.size
+            && cache.target == target
+            && cache.resolved_text == resolved_text
+        {
+            return Ok(Arc::clone(&cache.pixels));
+        }
+        let pixels = Arc::new(self.render_layer(spec, target, ctx)?);
+        self.cached_layer = Some(LayerCache {
+            content: spec.content.clone(),
+            size: spec.size,
+            target,
+            resolved_text,
+            pixels: Arc::clone(&pixels),
+        });
+        Ok(pixels)
     }
 
     /// 渲染一张裸水印图层（未定位、未旋转、未施加透明度）。
@@ -106,6 +145,18 @@ impl Renderer {
         ctx: &FieldContext,
     ) -> Result<()> {
         let decoded = image_job::decode(src, options.max_alloc_bytes)?;
+        self.watermark_decoded(&decoded, dst, spec, options, ctx)
+    }
+
+    /// 复用已解码素材，桌面预览导出时不再重新读取和解码源文件。
+    pub fn watermark_decoded<W: Write>(
+        &mut self,
+        decoded: &image_job::DecodedImage,
+        dst: W,
+        spec: &WatermarkSpec,
+        options: &ImageOptions,
+        ctx: &FieldContext,
+    ) -> Result<()> {
         let (width, height) = decoded.image.dimensions();
 
         let ctx =
@@ -119,7 +170,7 @@ impl Renderer {
         let mut spec = spec.clone();
         spec.sanitize();
 
-        let layer = self.render_layer(&spec, (width, height), &ctx)?;
+        let layer = self.cached_layer(&spec, (width, height), &ctx)?;
 
         let mut canvas = rgba_image_to_pixmap(&decoded.image)?;
         compose::compose(
@@ -131,12 +182,13 @@ impl Renderer {
         )?;
         let out = pixmap_to_rgba_image(canvas)?;
 
+        let empty = image_job::Metadata::default();
         let metadata = if options.keep_metadata {
-            decoded.metadata
+            &decoded.metadata
         } else {
-            image_job::Metadata::default()
+            &empty
         };
-        image_job::encode(&out, dst, options.format, &metadata)
+        image_job::encode(&out, dst, options.format, metadata)
     }
 
     /// 渲染与视频等尺寸的透明水印图层，编码成 PNG 字节。
@@ -214,7 +266,7 @@ impl Renderer {
         let mut spec = spec.clone();
         spec.sanitize();
 
-        let layer = self.render_layer(&spec, size, ctx)?;
+        let layer = self.cached_layer(&spec, size, ctx)?;
         let mut canvas = tiny_skia::Pixmap::new(size.0, size.1).ok_or(Error::InvalidSize {
             width: size.0,
             height: size.1,
@@ -285,9 +337,10 @@ impl Renderer {
             None => FieldContext::new(),
         };
 
-        let input = File::open(src)?;
-        let output = BufWriter::new(File::create(dst)?);
-        self.watermark_image(input, output, spec, options, &ctx)
+        image_job::write_atomic(dst.as_ref(), |output| {
+            let input = File::open(src)?;
+            self.watermark_image(input, output, spec, options, &ctx)
+        })
     }
 }
 

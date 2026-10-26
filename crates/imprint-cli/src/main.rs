@@ -419,6 +419,8 @@ fn run_image(cmd: ImageCmd) -> anyhow::Result<ExitCode> {
         })
         .collect();
 
+    batch::validate_output_paths(&items)?;
+
     if cmd.dry_run {
         for item in &items {
             println!("{} -> {}", item.src.display(), item.dst.display());
@@ -493,27 +495,32 @@ fn run_video(cmd: VideoCmd) -> anyhow::Result<ExitCode> {
     };
 
     let single_file_output = cmd.input.len() == 1 && !is_dir_like(&cmd.output);
+    let items: Vec<_> = cmd
+        .input
+        .iter()
+        .map(|src| BatchItem {
+            src: src.clone(),
+            dst: if single_file_output {
+                cmd.output.clone()
+            } else {
+                let ext = src.extension().and_then(|e| e.to_str()).unwrap_or("mp4");
+                batch::output_path(src, &cmd.output, ext, &cmd.suffix)
+            },
+        })
+        .collect();
+    batch::validate_output_paths(&items)?;
     let mut renderer = Renderer::new(Arc::new(FontLibrary::with_system_fonts()));
     let cancel = CancelToken::new();
     let mut failed = 0usize;
 
-    for src in &cmd.input {
+    for item in &items {
+        let (src, dst) = (&item.src, &item.dst);
         if !src.is_file() {
             eprintln!("跳过（不是文件）：{}", src.display());
             failed += 1;
             continue;
         }
 
-        let dst = if single_file_output {
-            cmd.output.clone()
-        } else {
-            let ext = src
-                .extension()
-                .and_then(|e| e.to_str())
-                .unwrap_or("mp4")
-                .to_owned();
-            batch::output_path(src, &cmd.output, &ext, &cmd.suffix)
-        };
         if let Some(parent) = dst.parent()
             && !parent.as_os_str().is_empty()
         {
@@ -525,7 +532,7 @@ fn run_video(cmd: VideoCmd) -> anyhow::Result<ExitCode> {
         match renderer.watermark_video(
             &pipeline,
             src,
-            &dst,
+            dst,
             &spec,
             &encode,
             &mut on_progress,
@@ -549,8 +556,7 @@ fn run_remove(cmd: RemoveCmd) -> anyhow::Result<ExitCode> {
         bail!("没有找到可处理的图片");
     }
 
-    let single_file_output = sources.len() == 1 && !is_dir_like(&cmd.output);
-    let extension = cmd.format.extension();
+    let items = image_items(&sources, &cmd.output, cmd.format, &cmd.suffix)?;
     let options = ImageOptions {
         format: cmd.format.to_output(cmd.quality),
         ..ImageOptions::default()
@@ -561,12 +567,8 @@ fn run_remove(cmd: RemoveCmd) -> anyhow::Result<ExitCode> {
     let mut worst_unrecoverable = 0f32;
     let mut mismatched = 0usize;
 
-    for src in &sources {
-        let dst = if single_file_output {
-            cmd.output.clone()
-        } else {
-            batch::output_path(src, &cmd.output, extension, &cmd.suffix)
-        };
+    for item in &items {
+        let (src, dst) = (&item.src, &item.dst);
         if let Some(parent) = dst.parent()
             && !parent.as_os_str().is_empty()
         {
@@ -587,8 +589,9 @@ fn run_remove(cmd: RemoveCmd) -> anyhow::Result<ExitCode> {
         let outcome = std::fs::File::open(src)
             .map_err(anyhow::Error::from)
             .and_then(|input| {
-                let output = std::io::BufWriter::new(std::fs::File::create(&dst)?);
-                Ok(renderer.remove_watermark(input, output, &spec, &options, &ctx)?)
+                Ok(imprint_core::image_job::write_atomic(dst, |output| {
+                    renderer.remove_watermark(input, output, &spec, &options, &ctx)
+                })?)
             });
 
         match outcome {
@@ -661,20 +664,15 @@ fn run_erase(cmd: EraseCmd) -> anyhow::Result<ExitCode> {
         bail!("没有找到可处理的图片");
     }
 
-    let single_file_output = sources.len() == 1 && !is_dir_like(&cmd.output);
-    let extension = cmd.format.extension();
+    let items = image_items(&sources, &cmd.output, cmd.format, &cmd.suffix)?;
     let options = ImageOptions {
         format: cmd.format.to_output(cmd.quality),
         ..ImageOptions::default()
     };
 
     let mut failed = 0usize;
-    for src in &sources {
-        let dst = if single_file_output {
-            cmd.output.clone()
-        } else {
-            batch::output_path(src, &cmd.output, extension, &cmd.suffix)
-        };
+    for item in &items {
+        let (src, dst) = (&item.src, &item.dst);
         if let Some(parent) = dst.parent()
             && !parent.as_os_str().is_empty()
         {
@@ -684,10 +682,9 @@ fn run_erase(cmd: EraseCmd) -> anyhow::Result<ExitCode> {
         let outcome = std::fs::File::open(src)
             .map_err(anyhow::Error::from)
             .and_then(|input| {
-                let output = std::io::BufWriter::new(std::fs::File::create(&dst)?);
-                Ok(imprint_core::inpaint::erase(
-                    input, output, &mask_spec, cmd.radius, &options,
-                )?)
+                Ok(imprint_core::image_job::write_atomic(dst, |output| {
+                    imprint_core::inpaint::erase(input, output, &mask_spec, cmd.radius, &options)
+                })?)
             });
 
         match outcome {
@@ -721,8 +718,7 @@ fn run_sign(cmd: SignCmd) -> anyhow::Result<ExitCode> {
         );
     }
 
-    let single_file_output = sources.len() == 1 && !is_dir_like(&cmd.output);
-    let extension = cmd.format.extension();
+    let items = image_items(&sources, &cmd.output, cmd.format, &cmd.suffix)?;
     let options = ImageOptions {
         format: cmd.format.to_output(cmd.quality),
         ..ImageOptions::default()
@@ -730,12 +726,8 @@ fn run_sign(cmd: SignCmd) -> anyhow::Result<ExitCode> {
     let strength = cmd.strength.to_strength();
     let mut failed = 0usize;
 
-    for src in &sources {
-        let dst = if single_file_output {
-            cmd.output.clone()
-        } else {
-            batch::output_path(src, &cmd.output, extension, &cmd.suffix)
-        };
+    for item in &items {
+        let (src, dst) = (&item.src, &item.dst);
         if let Some(parent) = dst.parent()
             && !parent.as_os_str().is_empty()
         {
@@ -749,8 +741,9 @@ fn run_sign(cmd: SignCmd) -> anyhow::Result<ExitCode> {
             )?;
             let signed =
                 imprint_core::blind::embed(&decoded.image, cmd.payload.as_bytes(), strength)?;
-            let out = std::io::BufWriter::new(std::fs::File::create(&dst)?);
-            imprint_core::image_job::encode(&signed, out, options.format, &decoded.metadata)?;
+            imprint_core::image_job::write_atomic(dst, |out| {
+                imprint_core::image_job::encode(&signed, out, options.format, &decoded.metadata)
+            })?;
             Ok(())
         })();
 
@@ -774,8 +767,12 @@ fn run_verify(cmd: VerifyCmd) -> anyhow::Result<ExitCode> {
     for src in &sources {
         match std::fs::File::open(src)
             .map_err(anyhow::Error::from)
-            .and_then(|f| Ok(imprint_core::image_job::decode(f, None)?))
-        {
+            .and_then(|f| {
+                Ok(imprint_core::image_job::decode(
+                    f,
+                    ImageOptions::default().max_alloc_bytes,
+                )?)
+            }) {
             Ok(decoded) => match imprint_core::blind::extract(&decoded.image) {
                 Some(payload) => {
                     found += 1;
@@ -888,6 +885,28 @@ fn collect_dir(
         }
     }
     Ok(())
+}
+
+fn image_items(
+    sources: &[PathBuf],
+    output: &Path,
+    format: FormatArg,
+    suffix: &str,
+) -> anyhow::Result<Vec<BatchItem>> {
+    let single = sources.len() == 1 && !is_dir_like(output);
+    let items: Vec<_> = sources
+        .iter()
+        .map(|src| BatchItem {
+            src: src.clone(),
+            dst: if single {
+                output.to_path_buf()
+            } else {
+                batch::output_path(src, output, format.extension(), suffix)
+            },
+        })
+        .collect();
+    batch::validate_output_paths(&items)?;
+    Ok(items)
 }
 
 /// 输出路径看起来是目录吗。
@@ -1011,5 +1030,50 @@ mod tests {
     fn missing_input_is_an_error() {
         let err = collect_inputs(&[PathBuf::from("/no/such/path")], false, IMAGE_EXTENSIONS);
         assert!(err.is_err());
+    }
+
+    #[test]
+    fn preset_styles_can_be_overridden_without_text() {
+        let path = std::env::temp_dir().join(format!("imprint-preset-{}.json", std::process::id()));
+        let spec = imprint_core::WatermarkSpec {
+            content: imprint_core::spec::Content::Text(imprint_core::spec::TextSpec {
+                template: "original".into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        std::fs::write(&path, serde_json::to_vec(&spec).unwrap()).unwrap();
+        let cli = Cli::try_parse_from([
+            "imprint",
+            "image",
+            "-i",
+            "in.png",
+            "-o",
+            "out.png",
+            "--preset",
+            path.to_str().unwrap(),
+            "--color",
+            "#FF0000",
+            "--weight",
+            "900",
+            "--font",
+            "Serif",
+        ])
+        .unwrap();
+        let Command::Image(cmd) = cli.command else {
+            panic!("image command");
+        };
+        let imprint_core::spec::Content::Text(text) = cmd.watermark.to_spec().unwrap().content
+        else {
+            panic!("text content");
+        };
+        assert_eq!(text.template, "original");
+        assert_eq!(text.color, imprint_core::spec::Rgba8::new(255, 0, 0, 255));
+        assert_eq!(text.weight, 900);
+        assert_eq!(
+            text.family,
+            imprint_core::spec::FontFamily::Name("Serif".into())
+        );
+        std::fs::remove_file(path).unwrap();
     }
 }

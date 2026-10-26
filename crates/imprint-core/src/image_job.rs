@@ -3,13 +3,19 @@
 //! 接口收 `Read + Seek` / `Write` 而非 `&Path`：Android 的文件选择返回
 //! `content://` URI，根本没有文件系统路径可用。便利的路径版本在 [`crate::Renderer`]。
 
-use std::io::{BufReader, Read, Seek, Write};
+use std::{
+    fs::{File, OpenOptions},
+    io::{BufReader, BufWriter, Read, Seek, Write},
+    path::{Path, PathBuf},
+    sync::atomic::{AtomicU64, Ordering},
+};
 
 use image::{
     DynamicImage, ImageDecoder, ImageReader, RgbaImage,
     codecs::{jpeg::JpegEncoder, png::PngEncoder, webp::WebPEncoder},
     metadata::Orientation,
 };
+use rayon::prelude::*;
 
 use crate::error::{Error, Result};
 
@@ -144,32 +150,96 @@ pub fn probe_dimensions<R: Read + Seek>(reader: R) -> Result<(u32, u32)> {
 /// 编码并写出。
 pub fn encode<W: Write>(
     image: &RgbaImage,
-    writer: W,
+    mut writer: W,
     format: OutputFormat,
     metadata: &Metadata,
 ) -> Result<()> {
     match format {
         OutputFormat::Jpeg { quality } => {
-            let mut encoder = JpegEncoder::new_with_quality(writer, quality.clamp(1, 100));
+            let mut encoder = JpegEncoder::new_with_quality(&mut writer, quality.clamp(1, 100));
             attach_metadata(&mut encoder, metadata);
             // JPEG 没有 alpha 通道，必须先降到 RGB；源图若带透明，透明处会塌成黑色，
             // 这是格式限制而非缺陷 —— 需要保留透明就该选 PNG / WebP。
-            DynamicImage::ImageRgba8(image.clone())
-                .to_rgb8()
-                .write_with_encoder(encoder)?;
+            let mut pixels = vec![0; image.as_raw().len() / 4 * 3];
+            pixels
+                .par_chunks_mut(4096 * 3)
+                .zip(image.as_raw().par_chunks(4096 * 4))
+                .for_each(|(dst, src)| {
+                    for (rgb, rgba) in dst
+                        .as_chunks_mut::<3>()
+                        .0
+                        .iter_mut()
+                        .zip(src.as_chunks::<4>().0)
+                    {
+                        rgb.copy_from_slice(&rgba[..3]);
+                    }
+                });
+            let rgb = image::RgbImage::from_raw(image.width(), image.height(), pixels).ok_or(
+                Error::InvalidSize {
+                    width: image.width(),
+                    height: image.height(),
+                },
+            )?;
+            rgb.write_with_encoder(encoder)?;
         }
         OutputFormat::Png => {
-            let mut encoder = PngEncoder::new(writer);
+            let mut encoder = PngEncoder::new(&mut writer);
             attach_metadata(&mut encoder, metadata);
             image.write_with_encoder(encoder)?;
         }
         OutputFormat::WebP => {
-            let mut encoder = WebPEncoder::new_lossless(writer);
+            let mut encoder = WebPEncoder::new_lossless(&mut writer);
             attach_metadata(&mut encoder, metadata);
             image.write_with_encoder(encoder)?;
         }
     }
+    // BufWriter 的 Drop 会忽略写入错误，必须在报告成功前显式刷出。
+    writer.flush()?;
     Ok(())
+}
+
+/// 先写入目标目录的临时文件，成功后替换目标；失败保留原文件。
+///
+/// 编码闭包返回时应已关闭输入，因而也支持 Windows 下原路径覆盖。
+pub fn write_atomic<T>(
+    dst: &Path,
+    encode: impl FnOnce(&mut BufWriter<File>) -> Result<T>,
+) -> Result<T> {
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let parent = dst
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    std::fs::create_dir_all(parent)?;
+    let (temp, file) = loop {
+        let path = parent.join(format!(
+            ".imprint-{}-{}.tmp",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        match OpenOptions::new().write(true).create_new(true).open(&path) {
+            Ok(file) => break (PendingOutput(path), file),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e.into()),
+        }
+    };
+    if let Ok(metadata) = std::fs::metadata(dst) {
+        file.set_permissions(metadata.permissions())?;
+    }
+    let mut writer = BufWriter::new(file);
+    let result = encode(&mut writer)?;
+    writer.flush()?;
+    drop(writer);
+    std::fs::rename(&temp.0, dst)?;
+    Ok(result)
+}
+
+struct PendingOutput(PathBuf);
+
+impl Drop for PendingOutput {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
 }
 
 /// 尽力把 EXIF / ICC 挂到编码器上。

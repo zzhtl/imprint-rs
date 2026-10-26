@@ -11,33 +11,39 @@ use imprint_core::{
     BatchItem, FieldContext, FontLibrary, ImageOptions, ItemOutcome, OutputFormat, Renderer, batch,
     image_job,
     spec::{
-        Anchor9, Content, FontFamily, Margin, Placement, Rgba8, SizeMode, TextAlign, TextSpec,
-        WatermarkSpec,
+        Anchor9, Content, FontFamily, Margin, Placement, Rgba8, ShadowSpec, SizeMode, StrokeSpec,
+        TextAlign, TextSpec, WatermarkSpec,
     },
 };
 
-use crate::{fonts, job::BatchTask, preview::PreviewState};
+use crate::{
+    fonts,
+    job::{Background, BatchTask},
+    preview::PreviewState,
+    theme,
+};
 
 /// 预览底图的长边上限。
 ///
 /// wgpu 后端下 `TextureOptions` 的 mipmap 不生效（egui 文档写明只有 egui_glow 支持），
 /// 所以必须在 CPU 侧预降采样，否则缩小显示的 4K 图会明显走样。
 const PREVIEW_MAX_SIDE: u32 = 2048;
+const IMAGE_EXTENSIONS: &[&str] = &["jpg", "jpeg", "png", "webp", "tif", "tiff", "bmp", "gif"];
 
 /// 当前打开的素材。
 pub struct Document {
-    pub path: Option<PathBuf>,
+    pub path: PathBuf,
     pub file_name: String,
     /// 全尺寸原图，导出时用。
-    pub full: RgbaImage,
-    pub metadata: image_job::Metadata,
+    pub decoded: Arc<image_job::DecodedImage>,
+    pub fields: FieldContext,
     /// 预览底图纹理，打开文件时上传一次，之后不动。
     pub base_texture: TextureHandle,
 }
 
 impl Document {
     pub fn size(&self) -> (u32, u32) {
-        self.full.dimensions()
+        self.decoded.image.dimensions()
     }
 }
 
@@ -53,9 +59,15 @@ pub struct ImprintApp {
     preview: PreviewState,
     output: ImageOptions,
     status: String,
-    /// 上一帧的 spec，用于检测内容变化并让预览纹理失效。
-    last_spec: Option<WatermarkSpec>,
+    loading: Option<Background<LoadedDocument>>,
+    exporting: Option<Background<PathBuf>>,
     smoke: Option<Smoke>,
+}
+
+struct LoadedDocument {
+    path: PathBuf,
+    decoded: image_job::DecodedImage,
+    preview: egui::ColorImage,
 }
 
 /// 冒烟模式：启动后自动载入素材、等界面稳定、截图、退出。
@@ -84,6 +96,7 @@ impl ImprintApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         let fonts = Arc::new(FontLibrary::with_system_fonts());
         fonts::install_cjk(&cc.egui_ctx, &fonts);
+        theme::install(&cc.egui_ctx);
 
         let spec = WatermarkSpec {
             content: Content::Text(TextSpec {
@@ -112,7 +125,8 @@ impl ImprintApp {
                 ..ImageOptions::default()
             },
             status: "打开一张图片开始".to_owned(),
-            last_spec: None,
+            loading: None,
+            exporting: None,
             smoke: Smoke::from_env(),
         };
 
@@ -126,41 +140,72 @@ impl ImprintApp {
     }
 
     fn open_path(&mut self, egui_ctx: &egui::Context, path: PathBuf) {
-        match self.load(egui_ctx, &path) {
-            Ok(doc) => {
-                let (w, h) = doc.size();
-                self.status = format!("{} · {w}×{h}", doc.file_name);
-                self.doc = Some(doc);
-                self.preview.invalidate();
-            }
-            Err(e) => self.status = format!("打开失败：{e}"),
+        if self.loading.is_some() {
+            return;
         }
+        self.status = format!(
+            "正在打开 {}…",
+            path.file_name().unwrap_or_default().to_string_lossy()
+        );
+        let max_alloc = self.output.max_alloc_bytes;
+        self.loading = Some(Background::spawn(egui_ctx.clone(), move || {
+            let decoded = image_job::decode(std::fs::File::open(&path)?, max_alloc)?;
+            let preview = downscale(&decoded.image, PREVIEW_MAX_SIDE);
+            let color = egui::ColorImage::from_rgba_unmultiplied(
+                [preview.width() as usize, preview.height() as usize],
+                preview.as_raw(),
+            );
+            Ok(LoadedDocument {
+                path,
+                decoded,
+                preview: color,
+            })
+        }));
     }
 
-    fn load(&self, egui_ctx: &egui::Context, path: &PathBuf) -> anyhow::Result<Document> {
-        let file = std::fs::File::open(path)?;
-        let decoded = image_job::decode(file, self.output.max_alloc_bytes)?;
-        let full = decoded.image;
-
-        let preview = downscale(&full, PREVIEW_MAX_SIDE);
-        let color = egui::ColorImage::from_rgba_unmultiplied(
-            [preview.width() as usize, preview.height() as usize],
-            preview.as_raw(),
-        );
-        let base_texture =
-            egui_ctx.load_texture("imprint_base", color, egui::TextureOptions::LINEAR);
-
-        Ok(Document {
-            file_name: path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("untitled")
-                .to_owned(),
-            path: Some(path.clone()),
-            full,
-            metadata: decoded.metadata,
-            base_texture,
-        })
+    fn poll_background(&mut self, ctx: &egui::Context) {
+        if let Some(result) = self.loading.as_ref().and_then(Background::poll) {
+            self.loading = None;
+            match result {
+                Ok(loaded) => {
+                    let file_name = loaded
+                        .path
+                        .file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .into_owned();
+                    let (w, h) = loaded.decoded.image.dimensions();
+                    let mut fields = FieldContext::new()
+                        .with_file_name(&file_name)
+                        .with_dimensions(w, h);
+                    if let Some(exif) = &loaded.decoded.metadata.exif {
+                        fields = fields.with_exif(imprint_core::ExifFields::parse(exif));
+                    }
+                    self.status = format!("已打开 {file_name} · {w} × {h}");
+                    self.doc = Some(Document {
+                        path: loaded.path,
+                        file_name,
+                        fields,
+                        decoded: Arc::new(loaded.decoded),
+                        base_texture: ctx.load_texture(
+                            "imprint_base",
+                            loaded.preview,
+                            egui::TextureOptions::LINEAR,
+                        ),
+                    });
+                    self.preview.invalidate();
+                    self.preview.show_original = false;
+                }
+                Err(e) => self.status = format!("打开失败：{e:#}"),
+            }
+        }
+        if let Some(result) = self.exporting.as_ref().and_then(Background::poll) {
+            self.exporting = None;
+            self.status = match result {
+                Ok(path) => format!("已导出 {}", path.display()),
+                Err(e) => format!("导出失败：{e:#}"),
+            };
+        }
     }
 
     fn save_preset(&mut self, dst: PathBuf) {
@@ -208,6 +253,10 @@ impl ImprintApp {
             })
             .collect();
 
+        if let Err(e) = batch::validate_output_paths(&items) {
+            self.status = e.to_string();
+            return;
+        }
         self.last_results.clear();
         self.status = format!("批量处理 {} 个文件…", items.len());
         self.task = Some(BatchTask::spawn(
@@ -219,159 +268,343 @@ impl ImprintApp {
         ));
     }
 
-    fn export(&mut self, dst: PathBuf) {
+    fn choose_image(&mut self, ctx: &egui::Context) {
+        if let Some(path) = rfd::FileDialog::new()
+            .add_filter("图片", IMAGE_EXTENSIONS)
+            .pick_file()
+        {
+            self.open_path(ctx, path);
+        }
+    }
+
+    fn choose_export(&mut self, ctx: &egui::Context) {
         let Some(doc) = &self.doc else {
             return;
         };
-        let src = match &doc.path {
-            Some(p) => p.clone(),
-            None => {
-                self.status = "当前素材没有来源路径，无法导出".to_owned();
-                return;
-            }
-        };
-        match self
-            .renderer
-            .watermark_image_file(&src, &dst, &self.spec, &self.output)
-        {
-            Ok(()) => self.status = format!("已导出 {}", dst.display()),
-            Err(e) => self.status = format!("导出失败：{e}"),
+        let stem = doc.path.file_stem().unwrap_or_default().to_string_lossy();
+        let name = format!("{stem}_watermarked.{}", self.output_extension());
+        if let Some(path) = rfd::FileDialog::new().set_file_name(name).save_file() {
+            self.export(ctx, path);
         }
+    }
+
+    fn import_paths(&mut self, ctx: &egui::Context, paths: Vec<PathBuf>) {
+        if paths.is_empty() {
+            return;
+        }
+        if self.loading.is_some() || self.task.is_some() {
+            self.status = "请等待当前加载或批量任务结束后再拖入文件".to_owned();
+            return;
+        }
+        if paths.len() == 1 && is_image_path(&paths[0]) {
+            self.open_path(ctx, paths[0].clone());
+            return;
+        }
+        let before = self.queue.len();
+        for path in paths {
+            if path.is_dir() {
+                self.add_dir(&path);
+            } else if is_image_path(&path) {
+                self.queue.push(path);
+            }
+        }
+        self.queue.sort();
+        self.queue.dedup();
+        self.status = format!(
+            "已添加 {} 张图片到队列；支持 JPEG / PNG / WebP / TIFF / BMP / GIF",
+            self.queue.len() - before
+        );
+        if self.doc.is_none()
+            && let Some(path) = self.queue.first().cloned()
+        {
+            self.open_path(ctx, path);
+        }
+    }
+
+    fn export(&mut self, ctx: &egui::Context, dst: PathBuf) {
+        let Some(doc) = &self.doc else {
+            return;
+        };
+        let decoded = Arc::clone(&doc.decoded);
+        let fonts = Arc::clone(&self.fonts);
+        let spec = self.spec.clone();
+        let options = self.output.clone();
+        let fields = doc.fields.clone();
+        self.status = "正在导出图片…".to_owned();
+        self.exporting = Some(Background::spawn(ctx.clone(), move || {
+            let mut renderer = Renderer::new(fonts);
+            image_job::write_atomic(&dst, |writer| {
+                renderer.watermark_decoded(&decoded, writer, &spec, &options, &fields)
+            })?;
+            Ok(dst)
+        }));
     }
 }
 
 impl eframe::App for ImprintApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let egui_ctx = ui.ctx().clone();
-
-        // spec 的内容部分一变就丢弃图层纹理；位置/旋转/透明度不触发重传。
-        if self.last_spec.as_ref() != Some(&self.spec) {
-            let content_changed = self
-                .last_spec
-                .as_ref()
-                .is_none_or(|s| s.content != self.spec.content || s.size != self.spec.size);
-            if content_changed {
-                self.preview.invalidate();
-            }
-            self.last_spec = Some(self.spec.clone());
+        self.poll_background(&egui_ctx);
+        let paths = egui_ctx.input(|i| {
+            i.raw
+                .dropped_files
+                .iter()
+                .map(|f| f.path().to_path_buf())
+                .collect()
+        });
+        self.import_paths(&egui_ctx, paths);
+        if egui_ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::O))
+            && self.loading.is_none()
+        {
+            self.choose_image(&egui_ctx);
+        }
+        if egui_ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::S))
+            && self.doc.is_some()
+            && self.loading.is_none()
+            && self.exporting.is_none()
+        {
+            self.choose_export(&egui_ctx);
         }
 
-        egui::Panel::top("toolbar").show(ui, |ui| {
-            ui.horizontal(|ui| {
-                if ui.button("打开图片…").clicked()
-                    && let Some(path) = rfd::FileDialog::new()
-                        .add_filter(
-                            "图片",
-                            &["jpg", "jpeg", "png", "webp", "tiff", "bmp", "gif"],
-                        )
-                        .pick_file()
-                {
-                    self.open_path(&egui_ctx, path);
-                }
-
-                ui.add_enabled_ui(self.doc.is_some(), |ui| {
-                    if ui.button("导出…").clicked() {
-                        let ext = match self.output.format {
-                            OutputFormat::Jpeg { .. } => "jpg",
-                            OutputFormat::Png => "png",
-                            OutputFormat::WebP => "webp",
-                        };
-                        let name = self
-                            .doc
-                            .as_ref()
-                            .map(|d| {
-                                let stem = d
-                                    .file_name
-                                    .rsplit_once('.')
-                                    .map_or(d.file_name.as_str(), |(s, _)| s);
-                                format!("{stem}_watermarked.{ext}")
-                            })
-                            .unwrap_or_else(|| format!("output.{ext}"));
-                        if let Some(path) = rfd::FileDialog::new().set_file_name(name).save_file() {
-                            self.export(path);
-                        }
-                    }
-                });
-
-                ui.separator();
-
-                if ui.button("保存预设…").clicked()
-                    && let Some(path) = rfd::FileDialog::new()
-                        .add_filter("预设", &["json"])
-                        .set_file_name("imprint_preset.json")
-                        .save_file()
-                {
-                    self.save_preset(path);
-                }
-                if ui.button("加载预设…").clicked()
-                    && let Some(path) = rfd::FileDialog::new()
-                        .add_filter("预设", &["json"])
-                        .pick_file()
-                {
-                    self.load_preset(path);
-                }
-
-                ui.separator();
-                ui.label(&self.status);
-            });
-        });
-
-        egui::Panel::left("queue")
-            .default_size(240.0)
+        egui::Panel::top("toolbar")
+            .frame(theme::panel())
             .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    let (logo, _) =
+                        ui.allocate_exact_size(egui::vec2(36.0, 36.0), egui::Sense::hover());
+                    ui.painter().rect_filled(logo, 10.0, theme::ACCENT);
+                    ui.painter().text(
+                        logo.center(),
+                        egui::Align2::CENTER_CENTER,
+                        "i",
+                        egui::FontId::proportional(28.0),
+                        theme::BACKGROUND,
+                    );
+                    ui.vertical(|ui| {
+                        ui.label(egui::RichText::new("imprint").size(22.0).strong());
+                        ui.label(
+                            egui::RichText::new("水印工作室")
+                                .size(11.0)
+                                .color(theme::MUTED),
+                        );
+                    });
+                    ui.add_space(28.0);
+                    if ui
+                        .add_enabled(self.loading.is_none(), egui::Button::new("打开图片"))
+                        .on_hover_text("打开图片（Ctrl / ⌘ + O）")
+                        .clicked()
+                    {
+                        self.choose_image(&egui_ctx);
+                    }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let ready = self.doc.is_some()
+                            && self.exporting.is_none()
+                            && self.loading.is_none();
+                        if ui
+                            .add_enabled(ready, theme::primary("导出图片"))
+                            .on_hover_text("导出图片（Ctrl / ⌘ + S）")
+                            .clicked()
+                        {
+                            self.choose_export(&egui_ctx);
+                        }
+                        ui.menu_button("预设", |ui| {
+                            if ui.button("加载预设…").clicked() {
+                                ui.close();
+                                if let Some(path) = rfd::FileDialog::new()
+                                    .add_filter("预设", &["json"])
+                                    .pick_file()
+                                {
+                                    self.load_preset(path);
+                                }
+                            }
+                            if ui.button("保存当前预设…").clicked() {
+                                ui.close();
+                                if let Some(path) = rfd::FileDialog::new()
+                                    .add_filter("预设", &["json"])
+                                    .set_file_name("imprint_preset.json")
+                                    .save_file()
+                                {
+                                    self.save_preset(path);
+                                }
+                            }
+                        });
+                    });
+                });
+            });
+
+        egui::Panel::bottom("status")
+            .frame(
+                egui::Frame::new()
+                    .fill(theme::PANEL)
+                    .inner_margin(egui::Margin::symmetric(16, 8)),
+            )
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    if self.loading.is_some() || self.exporting.is_some() {
+                        ui.spinner();
+                    } else {
+                        ui.colored_label(theme::ACCENT, "●");
+                    }
+                    ui.add_sized(
+                        [ui.available_width() - 210.0, 18.0],
+                        egui::Label::new(
+                            egui::RichText::new(&self.status)
+                                .size(12.0)
+                                .color(theme::MUTED),
+                        )
+                        .truncate(),
+                    )
+                    .on_hover_text(&self.status);
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.label(
+                            egui::RichText::new("本地处理 · 原始分辨率导出")
+                                .size(11.0)
+                                .color(theme::MUTED),
+                        );
+                    });
+                });
+            });
+        if self.task.is_some() {
+            egui::Panel::bottom("progress")
+                .frame(theme::panel())
+                .show(ui, |ui| self.progress_panel(ui));
+        }
+        egui::Panel::left("queue")
+            .default_size(236.0)
+            .resizable(false)
+            .frame(theme::panel())
+            .show(ui, |ui| {
+                if let Some(doc) = &self.doc {
+                    theme::section(ui, "", "当前素材");
+                    egui::Frame::new()
+                        .fill(theme::CARD)
+                        .corner_radius(8)
+                        .inner_margin(10)
+                        .show(ui, |ui| {
+                            let scale =
+                                (188.0 / doc.size().0 as f32).min(112.0 / doc.size().1 as f32);
+                            ui.image((
+                                doc.base_texture.id(),
+                                egui::vec2(
+                                    doc.size().0 as f32 * scale,
+                                    doc.size().1 as f32 * scale,
+                                ),
+                            ));
+                            ui.add(
+                                egui::Label::new(egui::RichText::new(&doc.file_name).strong())
+                                    .truncate(),
+                            )
+                            .on_hover_text(doc.path.display().to_string());
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "{} × {} px",
+                                    doc.size().0,
+                                    doc.size().1
+                                ))
+                                .size(12.0)
+                                .color(theme::MUTED),
+                            );
+                        });
+                    ui.add_space(18.0);
+                }
                 self.queue_panel(ui, &egui_ctx);
             });
-
-        if self.task.is_some() {
-            egui::Panel::bottom("progress").show(ui, |ui| {
-                self.progress_panel(ui);
-            });
-        }
-
         egui::Panel::right("params")
-            .default_size(320.0)
+            .default_size(300.0)
+            .resizable(false)
+            .frame(theme::panel())
             .show(ui, |ui| {
-                egui::ScrollArea::vertical().show(ui, |ui| {
-                    self.spec_panel(ui);
-                });
+                ui.label(egui::RichText::new("水印设置").size(18.0).strong());
+                ui.label(
+                    egui::RichText::new("调整参数，实时查看效果")
+                        .size(12.0)
+                        .color(theme::MUTED),
+                );
+                ui.add_space(8.0);
+                egui::ScrollArea::vertical().show(ui, |ui| self.spec_panel(ui));
             });
 
-        egui::CentralPanel::default().show(ui, |ui| {
-            let Some(doc) = &self.doc else {
-                ui.centered_and_justified(|ui| {
-                    ui.label("点击「打开图片…」载入素材");
-                });
-                return;
-            };
-
-            let ctx = field_context(doc);
-
-            let out = crate::preview::show(
-                ui,
-                &mut self.preview,
-                &mut self.renderer,
-                &self.spec,
-                &doc.base_texture,
-                doc.size(),
-                &ctx,
-            );
-
-            if let Some((x, y)) = out.dragged_to {
-                let anchor = match self.spec.placement {
-                    Placement::Normalized { anchor, .. } => anchor,
-                    _ => Anchor9::Center,
+        egui::CentralPanel::default()
+            .frame(egui::Frame::new().fill(theme::BACKGROUND).inner_margin(20))
+            .show(ui, |ui| {
+                let Some(doc) = &self.doc else {
+                    ui.vertical_centered(|ui| {
+                        ui.add_space((ui.available_height() * 0.28).max(20.0));
+                        let (icon, _) =
+                            ui.allocate_exact_size(egui::vec2(84.0, 84.0), egui::Sense::hover());
+                        ui.painter().rect_filled(icon, 22.0, theme::CARD);
+                        ui.painter().rect_stroke(
+                            icon.shrink(23.0),
+                            4.0,
+                            egui::Stroke::new(2.0, theme::ACCENT),
+                            egui::StrokeKind::Inside,
+                        );
+                        ui.painter().line_segment(
+                            [
+                                icon.center() + egui::vec2(-12.0, 9.0),
+                                icon.center() + egui::vec2(0.0, -5.0),
+                            ],
+                            egui::Stroke::new(2.0, theme::ACCENT),
+                        );
+                        ui.painter().line_segment(
+                            [
+                                icon.center() + egui::vec2(0.0, -5.0),
+                                icon.center() + egui::vec2(13.0, 9.0),
+                            ],
+                            egui::Stroke::new(2.0, theme::ACCENT),
+                        );
+                        ui.add_space(18.0);
+                        ui.label(egui::RichText::new("从一张图片开始").size(24.0).strong());
+                        ui.label(
+                            egui::RichText::new("拖入图片或目录，添加水印后导出作品")
+                                .color(theme::MUTED),
+                        );
+                        ui.add_space(14.0);
+                        if ui
+                            .add_enabled(self.loading.is_none(), theme::primary("选择图片"))
+                            .clicked()
+                        {
+                            self.choose_image(&egui_ctx);
+                        }
+                        ui.add_space(8.0);
+                        ui.label(
+                            egui::RichText::new("JPEG / PNG / WebP / TIFF / BMP / GIF")
+                                .size(11.0)
+                                .color(theme::MUTED),
+                        );
+                    });
+                    return;
                 };
-                // 一旦拖动就切到归一化定位，这样位置在任何分辨率下都成立。
-                self.spec.placement = Placement::Normalized { x, y, anchor };
-            }
 
-            if let Some(err) = &self.preview.last_error {
-                ui.colored_label(
-                    Color32::from_rgb(230, 120, 120),
-                    format!("水印渲染失败：{err}"),
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("效果预览").size(16.0).strong());
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.selectable_value(&mut self.preview.show_original, false, "水印效果");
+                        ui.selectable_value(&mut self.preview.show_original, true, "原图");
+                    });
+                });
+                ui.add_space(8.0);
+                let ctx = field_context(doc);
+
+                let out = crate::preview::show(
+                    ui,
+                    &mut self.preview,
+                    &mut self.renderer,
+                    &self.spec,
+                    &doc.base_texture,
+                    doc.size(),
+                    &ctx,
                 );
-            }
-        });
+
+                if let Some((x, y)) = out.dragged_to {
+                    let anchor = match self.spec.placement {
+                        Placement::Normalized { anchor, .. } => anchor,
+                        _ => Anchor9::Center,
+                    };
+                    // 一旦拖动就切到归一化定位，这样位置在任何分辨率下都成立。
+                    self.spec.placement = Placement::Normalized { x, y, anchor };
+                }
+            });
 
         self.drive_smoke(&egui_ctx);
     }
@@ -382,6 +615,10 @@ impl ImprintApp {
         let Some(smoke) = &mut self.smoke else {
             return;
         };
+        if self.loading.is_some() {
+            ctx.request_repaint();
+            return;
+        }
         if smoke.warmup_frames > 0 {
             smoke.warmup_frames -= 1;
             ctx.request_repaint();
@@ -425,25 +662,34 @@ impl ImprintApp {
 
 impl ImprintApp {
     fn queue_panel(&mut self, ui: &mut egui::Ui, egui_ctx: &egui::Context) {
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("批量处理").size(16.0).strong());
+            ui.label(
+                egui::RichText::new(format!("{}", self.queue.len()))
+                    .size(12.0)
+                    .color(theme::ACCENT),
+            );
+        });
+        ui.label(
+            egui::RichText::new("同一套水印，应用到多张图片")
+                .size(11.0)
+                .color(theme::MUTED),
+        );
         ui.add_space(6.0);
-        ui.heading("批量队列");
 
         let busy = self.task.as_ref().is_some_and(|t| !t.is_finished());
         ui.add_enabled_ui(!busy, |ui| {
             ui.horizontal(|ui| {
-                if ui.button("加文件…").clicked()
+                if ui.button("添加文件").clicked()
                     && let Some(paths) = rfd::FileDialog::new()
-                        .add_filter(
-                            "图片",
-                            &["jpg", "jpeg", "png", "webp", "tiff", "bmp", "gif"],
-                        )
+                        .add_filter("图片", IMAGE_EXTENSIONS)
                         .pick_files()
                 {
                     self.queue.extend(paths);
                     self.queue.sort();
                     self.queue.dedup();
                 }
-                if ui.button("加目录…").clicked()
+                if ui.button("添加目录").clicked()
                     && let Some(dir) = rfd::FileDialog::new().pick_folder()
                 {
                     self.add_dir(&dir);
@@ -454,7 +700,9 @@ impl ImprintApp {
                     self.queue.clear();
                     self.last_results.clear();
                 }
-                if ui.button("批量导出…").clicked()
+                if ui
+                    .add_enabled(!self.queue.is_empty(), egui::Button::new("批量导出"))
+                    .clicked()
                     && let Some(dir) = rfd::FileDialog::new().pick_folder()
                 {
                     self.start_batch(egui_ctx, dir);
@@ -463,12 +711,29 @@ impl ImprintApp {
         });
 
         ui.separator();
-        ui.label(format!("{} 个文件", self.queue.len()));
+        if self.queue.is_empty() {
+            egui::Frame::new()
+                .fill(theme::CARD)
+                .corner_radius(8)
+                .inner_margin(16)
+                .show(ui, |ui| {
+                    ui.label(egui::RichText::new("队列还是空的").color(theme::MUTED));
+                    ui.label(
+                        egui::RichText::new(
+                            "添加文件或整个目录，
+一次完成批量导出。",
+                        )
+                        .size(12.0)
+                        .color(theme::MUTED),
+                    );
+                });
+        }
 
         egui::ScrollArea::vertical()
             .max_height(ui.available_height() * 0.6)
             .show(ui, |ui| {
                 let mut remove = None;
+                let mut open = None;
                 for (i, path) in self.queue.iter().enumerate() {
                     let name = path
                         .file_name()
@@ -476,25 +741,46 @@ impl ImprintApp {
                         .unwrap_or("?")
                         .to_owned();
                     ui.horizontal(|ui| {
-                        if ui.small_button("×").clicked() {
+                        if ui
+                            .add_enabled(!busy, egui::Button::new("×").small())
+                            .clicked()
+                        {
                             remove = Some(i);
                         }
                         // 长文件名会把面板撑开，截断显示、完整内容放 tooltip。
-                        ui.label(elide(&name, 22))
-                            .on_hover_text(path.display().to_string());
+                        let selected = self.doc.as_ref().is_some_and(|doc| &doc.path == path);
+                        if ui
+                            .selectable_label(selected, elide(&name, 18))
+                            .on_hover_text(path.display().to_string())
+                            .clicked()
+                        {
+                            open = Some(path.clone());
+                        }
                     });
                 }
                 if let Some(i) = remove {
                     self.queue.remove(i);
                 }
+                if let Some(path) = open {
+                    self.open_path(egui_ctx, path);
+                }
             });
 
         if !self.last_results.is_empty() {
             ui.separator();
-            let failed: Vec<&ItemOutcome> =
-                self.last_results.iter().filter(|o| !o.is_ok()).collect();
-            if failed.is_empty() {
+            let failed: Vec<&ItemOutcome> = self
+                .last_results
+                .iter()
+                .filter(|o| {
+                    o.result
+                        .as_ref()
+                        .is_err_and(|e| !matches!(e, imprint_core::Error::Cancelled))
+                })
+                .collect();
+            if self.last_results.iter().all(ItemOutcome::is_ok) {
                 ui.colored_label(Color32::from_rgb(120, 200, 120), "全部成功");
+            } else if failed.is_empty() {
+                ui.colored_label(theme::MUTED, "已取消，已导出的文件保留");
             } else {
                 ui.colored_label(
                     Color32::from_rgb(230, 150, 120),
@@ -517,19 +803,13 @@ impl ImprintApp {
     }
 
     fn add_dir(&mut self, dir: &Path) {
-        const EXTS: &[&str] = &["jpg", "jpeg", "png", "webp", "tif", "tiff", "bmp", "gif"];
         let Ok(entries) = std::fs::read_dir(dir) else {
             self.status = format!("无法读取目录 {}", dir.display());
             return;
         };
         for entry in entries.flatten() {
             let path = entry.path();
-            let ok = path.is_file()
-                && path
-                    .extension()
-                    .and_then(|e| e.to_str())
-                    .is_some_and(|e| EXTS.iter().any(|w| e.eq_ignore_ascii_case(w)));
-            if ok {
+            if is_image_path(&path) {
                 self.queue.push(path);
             }
         }
@@ -564,25 +844,28 @@ impl ImprintApp {
             }
         });
 
-        if let Some(results) = task.poll() {
-            let failed = results.iter().filter(|o| !o.is_ok()).count();
-            self.status = if failed == 0 {
-                format!("批量完成：{} 个全部成功", results.len())
-            } else {
-                format!("批量完成：{} 成功 / {failed} 失败", results.len() - failed)
+        if let Some(result) = task.poll() {
+            let results = match result {
+                Ok(results) => results,
+                Err(e) => {
+                    self.status = e;
+                    self.task = None;
+                    return;
+                }
             };
+            self.status = batch_summary(&results);
             self.last_results = results;
             self.task = None;
         }
     }
 
     fn spec_panel(&mut self, ui: &mut egui::Ui) {
-        ui.add_space(6.0);
-        ui.heading("水印内容");
+        theme::section(ui, "01", "内容");
 
         if let Content::Text(text) = &mut self.spec.content {
             ui.add(
                 egui::TextEdit::multiline(&mut text.template)
+                    .desired_width(f32::INFINITY)
                     .desired_rows(3)
                     .hint_text("支持 {filename} {date} {width}x{height} {exif.model}"),
             );
@@ -596,7 +879,8 @@ impl ImprintApp {
                     text.color.a,
                 );
                 if ui.color_edit_button_srgba(&mut c).changed() {
-                    text.color = Rgba8::new(c.r(), c.g(), c.b(), c.a());
+                    let [r, g, b, a] = c.to_srgba_unmultiplied();
+                    text.color = Rgba8::new(r, g, b, a);
                 }
 
                 ui.label("字重");
@@ -619,15 +903,15 @@ impl ImprintApp {
         }
 
         ui.separator();
-        ui.heading("尺寸");
+        theme::section(ui, "02", "尺寸");
         size_controls(ui, &mut self.spec.size);
 
         ui.separator();
-        ui.heading("位置");
+        theme::section(ui, "03", "位置");
         placement_controls(ui, &mut self.spec.placement);
 
         ui.separator();
-        ui.heading("样式");
+        theme::section(ui, "04", "样式");
         ui.horizontal(|ui| {
             ui.label("不透明度");
             ui.add(egui::Slider::new(&mut self.spec.opacity, 0.0..=1.0).fixed_decimals(2));
@@ -636,10 +920,56 @@ impl ImprintApp {
             ui.label("旋转");
             ui.add(egui::Slider::new(&mut self.spec.rotation_deg, -180.0..=180.0).suffix("°"));
         });
+        if let Content::Text(text) = &mut self.spec.content {
+            ui.horizontal(|ui| {
+                let mut stroke = text.stroke.is_some();
+                if ui.checkbox(&mut stroke, "描边").changed() {
+                    text.stroke = stroke.then_some(StrokeSpec {
+                        width_ratio: 0.06,
+                        color: Rgba8::new(12, 16, 24, 220),
+                    });
+                }
+                let mut shadow = text.shadow.is_some();
+                if ui.checkbox(&mut shadow, "阴影").changed() {
+                    text.shadow = shadow.then_some(ShadowSpec {
+                        offset_ratio: (0.08, 0.08),
+                        color: Rgba8::new(0, 0, 0, 160),
+                    });
+                }
+            });
+            if let Some(stroke) = &mut text.stroke {
+                ui.add(egui::Slider::new(&mut stroke.width_ratio, 0.01..=0.25).text("描边粗细"));
+            }
+        }
 
         ui.separator();
-        ui.heading("输出");
+        theme::section(ui, "05", "输出");
         output_controls(ui, &mut self.output);
+    }
+}
+
+fn is_image_path(path: &Path) -> bool {
+    path.is_file()
+        && path.extension().and_then(|e| e.to_str()).is_some_and(|e| {
+            IMAGE_EXTENSIONS
+                .iter()
+                .any(|ext| e.eq_ignore_ascii_case(ext))
+        })
+}
+
+fn batch_summary(results: &[ItemOutcome]) -> String {
+    let success = results.iter().filter(|o| o.is_ok()).count();
+    let cancelled = results
+        .iter()
+        .filter(|o| matches!(o.result, Err(imprint_core::Error::Cancelled)))
+        .count();
+    let failed = results.len() - success - cancelled;
+    if cancelled > 0 {
+        format!("已取消：{success} 成功 / {failed} 失败 / {cancelled} 未处理")
+    } else if failed == 0 {
+        format!("批量完成：{success} 个全部成功")
+    } else {
+        format!("批量完成：{success} 成功 / {failed} 失败")
     }
 }
 
@@ -865,14 +1195,7 @@ fn elide(s: &str, max_chars: usize) -> String {
 /// 写成自由函数而非方法：借 `&self` 的方法会和 `&mut self.preview`
 /// 的字段借用冲突，而字段级的分割借用是允许的。
 fn field_context(doc: &Document) -> FieldContext {
-    let (w, h) = doc.size();
-    let mut ctx = FieldContext::new()
-        .with_file_name(&doc.file_name)
-        .with_dimensions(w, h);
-    if let Some(raw) = &doc.metadata.exif {
-        ctx = ctx.with_exif(imprint_core::ExifFields::parse(raw));
-    }
-    ctx
+    doc.fields.clone()
 }
 
 /// 把图片降采样到长边不超过 `max_side`。
@@ -891,6 +1214,107 @@ fn downscale(src: &RgbaImage, max_side: u32) -> RgbaImage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn batch_cancellation_is_not_reported_as_failure() {
+        let results = [
+            Ok(()),
+            Err(imprint_core::Error::Cancelled),
+            Err(imprint_core::Error::EmptyContent),
+        ]
+        .into_iter()
+        .map(|result| ItemOutcome {
+            src: PathBuf::from("input.png"),
+            dst: PathBuf::from("output.png"),
+            result,
+        })
+        .collect::<Vec<_>>();
+        assert_eq!(
+            batch_summary(&results),
+            "已取消：1 成功 / 1 失败 / 1 未处理"
+        );
+    }
+
+    #[test]
+    fn background_export_uses_loaded_pixels_even_after_source_is_removed() {
+        let ctx = egui::Context::default();
+        let fonts = Arc::new(FontLibrary::with_system_fonts());
+        let mut app = ImprintApp {
+            renderer: Renderer::new(Arc::clone(&fonts)),
+            fonts,
+            queue: Vec::new(),
+            task: None,
+            last_results: Vec::new(),
+            spec: WatermarkSpec {
+                content: Content::Text(TextSpec {
+                    template: "Saved".into(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            doc: None,
+            preview: PreviewState::default(),
+            output: ImageOptions {
+                format: OutputFormat::Png,
+                ..Default::default()
+            },
+            status: String::new(),
+            loading: None,
+            exporting: None,
+            smoke: None,
+        };
+        let dir =
+            std::env::temp_dir().join(format!("imprint-ui-background-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("source.png");
+        let dst = dir.join("output.png");
+        RgbaImage::from_pixel(240, 160, image::Rgba([80, 100, 120, 255]))
+            .save(&src)
+            .unwrap();
+        app.open_path(&ctx, src.clone());
+        let wait = |app: &mut ImprintApp| {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while app.loading.is_some() || app.exporting.is_some() {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "background operation timed out"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(5));
+                app.poll_background(&ctx);
+            }
+        };
+        wait(&mut app);
+        assert_eq!(app.doc.as_ref().unwrap().size(), (240, 160));
+        std::fs::remove_file(&src).unwrap();
+        app.export(&ctx, dst.clone());
+        wait(&mut app);
+        let output = image::open(&dst).unwrap().to_rgba8();
+        assert_eq!(output.dimensions(), (240, 160));
+        assert!(output.pixels().any(|p| p.0 != [80, 100, 120, 255]));
+        app.open_path(&ctx, src);
+        wait(&mut app);
+        assert!(app.status.starts_with("打开失败"));
+        assert!(
+            app.doc.is_some(),
+            "load failure must preserve the current document"
+        );
+        let second = dir.join("second.TIF");
+        let ignored = dir.join("notes.txt");
+        std::fs::write(&second, b"queued by extension").unwrap();
+        std::fs::write(&ignored, b"not an image").unwrap();
+        app.import_paths(&ctx, vec![dir.clone(), dst.clone(), ignored]);
+        assert_eq!(app.queue, vec![dst.clone(), second]);
+        app.import_paths(&ctx, vec![dir.clone(), dst.clone()]);
+        assert_eq!(
+            app.queue.len(),
+            2,
+            "repeated drops must not duplicate queued files"
+        );
+        app.import_paths(&ctx, vec![dst]);
+        wait(&mut app);
+        assert_eq!(app.doc.as_ref().unwrap().file_name, "output.png");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn elide_keeps_short_names_intact() {

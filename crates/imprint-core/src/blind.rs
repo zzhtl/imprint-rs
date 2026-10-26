@@ -117,16 +117,19 @@ pub fn embed(image: &RgbaImage, payload: &[u8], strength: Strength) -> Result<Rg
 
     let mut out = image.clone();
     let mut luma = extract_luma(image);
+    let basis = coefficient_basis();
 
     for by in 0..blocks_y {
         for bx in 0..blocks_x {
             let bit = bits[slot_of(bx, by, bits.len())];
 
             let mut block = read_block(&luma, width as usize, bx, by);
-            dct8x8(&mut block);
-            block[COEF.0 * BLOCK + COEF.1] =
-                quantize_to_parity(block[COEF.0 * BLOCK + COEF.1], bit, strength.get());
-            idct8x8(&mut block);
+            // 只改变一个正交系数，无需算完整 DCT 再逆变换。
+            let coefficient = dot(&block, basis);
+            let delta = quantize_to_parity(coefficient, bit, strength.get()) - coefficient;
+            for (value, weight) in block.iter_mut().zip(basis) {
+                *value += delta * weight;
+            }
             write_block(&mut luma, width as usize, bx, by, &block);
         }
     }
@@ -139,6 +142,18 @@ pub fn embed(image: &RgbaImage, payload: &[u8], strength: Strength) -> Result<Rg
 ///
 /// 返回 `None` 表示没找到有效水印（魔数或校验不匹配）。
 pub fn extract(image: &RgbaImage) -> Option<Vec<u8>> {
+    extract_with_steps(
+        image,
+        &[Strength::DEFAULT, Strength::ROBUST, Strength::SUBTLE],
+    )
+}
+
+/// 提取使用自定义量化步长嵌入的载荷。
+pub fn extract_with_strength(image: &RgbaImage, strength: Strength) -> Option<Vec<u8>> {
+    extract_with_steps(image, &[strength])
+}
+
+fn extract_with_steps(image: &RgbaImage, strengths: &[Strength]) -> Option<Vec<u8>> {
     let (width, height) = image.dimensions();
     let blocks_x = width as usize / BLOCK;
     let blocks_y = height as usize / BLOCK;
@@ -147,25 +162,36 @@ pub fn extract(image: &RgbaImage) -> Option<Vec<u8>> {
     }
 
     let luma = extract_luma(image);
-    // 先把每个块的 bit 连同坐标读出来，再按候选帧长归入槽位统计。
-    let mut raw = Vec::with_capacity(blocks_x * blocks_y);
+    // 系数只计算一次，尝试不同强度时复用；旧版默认强度的图片仍可提取。
+    let mut coefficients = Vec::with_capacity(blocks_x * blocks_y);
     for by in 0..blocks_y {
         for bx in 0..blocks_x {
-            let mut block = read_block(&luma, width as usize, bx, by);
-            dct8x8(&mut block);
-            raw.push((bx, by, parity_of(block[COEF.0 * BLOCK + COEF.1])));
+            let block = read_block(&luma, width as usize, bx, by);
+            coefficients.push((bx, by, dot(&block, coefficient_basis())));
         }
     }
 
     // 帧长取决于载荷长度，事先并不知道，因此逐个长度试解。
     // 帧头自带魔数与 CRC，猜错长度几乎不可能通过校验。
-    for len in 1..=MAX_PAYLOAD {
-        let frame_bits = frame_bit_len(len);
-        if frame_bits > raw.len() {
-            break;
-        }
-        if let Some(payload) = decode_with_voting(&raw, frame_bits, len) {
-            return Some(payload);
+    for strength in strengths {
+        let raw: Vec<_> = coefficients
+            .iter()
+            .map(|&(bx, by, value)| {
+                (
+                    bx,
+                    by,
+                    ((value / strength.get()).round() as i64).rem_euclid(2) as u8,
+                )
+            })
+            .collect();
+        for len in 1..=MAX_PAYLOAD {
+            let frame_bits = frame_bit_len(len);
+            if frame_bits > raw.len() {
+                break;
+            }
+            if let Some(payload) = decode_with_voting(&raw, frame_bits, len) {
+                return Some(payload);
+            }
         }
     }
     None
@@ -280,8 +306,21 @@ fn quantize_to_parity(value: f32, bit: u8, step: f32) -> f32 {
     target * step
 }
 
-fn parity_of(value: f32) -> u8 {
-    ((value / Strength::DEFAULT.get()).round() as i64).rem_euclid(2) as u8
+fn coefficient_basis() -> &'static [f32; BLOCK * BLOCK] {
+    static BASIS: std::sync::OnceLock<[f32; BLOCK * BLOCK]> = std::sync::OnceLock::new();
+    BASIS.get_or_init(|| {
+        std::array::from_fn(|i| {
+            let (y, x) = (i / BLOCK, i % BLOCK);
+            let angle = std::f32::consts::PI / BLOCK as f32;
+            2.0 / BLOCK as f32
+                * (angle * (y as f32 + 0.5) * COEF.0 as f32).cos()
+                * (angle * (x as f32 + 0.5) * COEF.1 as f32).cos()
+        })
+    })
+}
+
+fn dot(block: &[f32; BLOCK * BLOCK], basis: &[f32; BLOCK * BLOCK]) -> f32 {
+    block.iter().zip(basis).map(|(v, w)| v * w).sum()
 }
 
 /// 取出亮度通道（BT.601）。
@@ -323,6 +362,7 @@ fn write_block(luma: &mut [f32], width: usize, bx: usize, by: usize, block: &[f3
 }
 
 /// 8×8 二维 DCT-II，行列分离实现。
+#[cfg(test)]
 fn dct8x8(block: &mut [f32; BLOCK * BLOCK]) {
     let mut tmp = [0f32; BLOCK * BLOCK];
     for y in 0..BLOCK {
@@ -339,6 +379,7 @@ fn dct8x8(block: &mut [f32; BLOCK * BLOCK]) {
     }
 }
 
+#[cfg(test)]
 fn idct8x8(block: &mut [f32; BLOCK * BLOCK]) {
     let mut tmp = [0f32; BLOCK * BLOCK];
     for x in 0..BLOCK {
@@ -356,6 +397,7 @@ fn idct8x8(block: &mut [f32; BLOCK * BLOCK]) {
 }
 
 /// 8 点一维 DCT-II（正交归一）。
+#[cfg(test)]
 fn dct1d(input: &[f32; BLOCK]) -> [f32; BLOCK] {
     std::array::from_fn(|k| {
         let scale = if k == 0 {
@@ -373,6 +415,7 @@ fn dct1d(input: &[f32; BLOCK]) -> [f32; BLOCK] {
     })
 }
 
+#[cfg(test)]
 fn idct1d(input: &[f32; BLOCK]) -> [f32; BLOCK] {
     std::array::from_fn(|n| {
         (0..BLOCK)
@@ -393,6 +436,22 @@ fn idct1d(input: &[f32; BLOCK]) -> [f32; BLOCK] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn single_coefficient_update_matches_full_transform() {
+        let original: [f32; 64] = std::array::from_fn(|i| ((i * 7) % 251) as f32);
+        let mut reference = original;
+        dct8x8(&mut reference);
+        assert!(
+            (reference[COEF.0 * BLOCK + COEF.1] - dot(&original, coefficient_basis())).abs()
+                < 0.001
+        );
+        reference[COEF.0 * BLOCK + COEF.1] += 18.0;
+        idct8x8(&mut reference);
+        for ((before, weight), after) in original.iter().zip(coefficient_basis()).zip(reference) {
+            assert!((before + 18.0 * weight - after).abs() < 0.001);
+        }
+    }
 
     /// 造一张有真实纹理的测试图。
     ///

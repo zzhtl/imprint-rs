@@ -118,6 +118,19 @@ impl WatermarkArgs {
             bail!("必须指定 --text 或 --logo（或用 --preset 提供）");
         }
 
+        // 样式覆盖不要求再次传 --text，否则读取预设时这些参数会被静默忽略。
+        if let Content::Text(text) = &mut spec.content {
+            if let Some(color) = &self.color {
+                text.color = parse_color(color)?;
+            }
+            if let Some(weight) = self.weight {
+                text.weight = weight;
+            }
+            if let Some(font) = &self.font {
+                text.family = imprint_core::spec::FontFamily::Name(font.clone());
+            }
+        }
+
         if let Some(size) = &self.size {
             spec.size = parse_size(size)?;
         }
@@ -135,6 +148,17 @@ impl WatermarkArgs {
                 self.position.as_deref().unwrap_or("br"),
                 self.margin.as_deref().unwrap_or("0.02,0.02"),
             )?;
+        } else if let Placement::Tile {
+            spacing_ratio,
+            stagger,
+        } = &mut spec.placement
+        {
+            if let Some(spacing) = &self.tile_spacing {
+                *spacing_ratio = parse_pair(spacing).context("解析 --tile-spacing")?;
+            }
+            if self.stagger {
+                *stagger = true;
+            }
         }
 
         if let Some(opacity) = self.opacity {

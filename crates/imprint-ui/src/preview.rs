@@ -43,6 +43,7 @@ struct LayerTexture {
 #[derive(Default)]
 pub struct PreviewState {
     layer: Option<LayerTexture>,
+    pub show_original: bool,
     /// 上一次渲染图层失败的原因，显示给用户而不是静默留空。
     pub last_error: Option<String>,
 }
@@ -76,10 +77,31 @@ pub fn show(
     let avail = ui.available_size();
     let (rect, _) = ui.allocate_exact_size(avail, Sense::hover());
     // 按原图宽高比把图片摆进可用区域，居中。
-    let image_rect = fit_rect(rect, canvas_size);
+    let image_rect = fit_rect(rect.shrink(24.0), canvas_size);
 
     let painter = ui.painter_at(rect);
-    painter.rect_filled(rect, 0.0, Color32::from_gray(28));
+    painter.rect_filled(rect, 10.0, Color32::from_rgb(17, 21, 29));
+    painter.rect_filled(
+        image_rect.expand(5.0).translate(Vec2::new(0.0, 4.0)),
+        4.0,
+        Color32::from_black_alpha(60),
+    );
+    // 棋盘格让 PNG 的透明区域可见。
+    let checker = painter.with_clip_rect(image_rect);
+    let cell = 16.0;
+    for y in 0..(image_rect.height() / cell).ceil() as i32 {
+        for x in 0..(image_rect.width() / cell).ceil() as i32 {
+            let gray = if (x + y) % 2 == 0 { 38 } else { 44 };
+            checker.rect_filled(
+                Rect::from_min_size(
+                    image_rect.min + Vec2::new(x as f32 * cell, y as f32 * cell),
+                    Vec2::splat(cell),
+                ),
+                0.0,
+                Color32::from_gray(gray),
+            );
+        }
+    }
     painter.image(
         base_texture.id(),
         image_rect,
@@ -87,14 +109,35 @@ pub fn show(
         Color32::WHITE,
     );
 
+    if state.show_original {
+        return out;
+    }
+
     // 图层按**预览尺寸**渲染，与底图纹理对齐；导出时再按原图尺寸重渲一次。
     let preview_canvas = (
         image_rect.width().round().max(1.0) as u32,
         image_rect.height().round().max(1.0) as u32,
     );
-    ensure_layer(ui.ctx(), state, renderer, spec, preview_canvas, ctx);
+    ensure_layer(
+        ui.ctx(),
+        state,
+        renderer,
+        spec,
+        preview_canvas,
+        canvas_size,
+        ctx,
+    );
 
     let Some(layer) = &state.layer else {
+        if let Some(error) = &state.last_error {
+            painter.text(
+                rect.left_top() + Vec2::splat(16.0),
+                egui::Align2::LEFT_TOP,
+                format!("水印渲染失败：{error}"),
+                egui::FontId::proportional(13.0),
+                Color32::from_rgb(242, 150, 150),
+            );
+        }
         return out;
     };
 
@@ -126,7 +169,7 @@ pub fn show(
             let top_left = image_rect.min + Vec2::new(ox * scale, oy * scale);
             let wm_rect = Rect::from_min_size(top_left, layer_px);
             draw_quad(
-                &painter,
+                &painter.with_clip_rect(image_rect),
                 layer.texture.id(),
                 wm_rect,
                 spec.rotation_deg,
@@ -149,9 +192,14 @@ pub fn show(
             if response.dragged() {
                 // drag_delta 已按 layer transform 的 scaling 折算过，这里只需换算
                 // 预览像素 → 归一化坐标，不要再除一次缩放。
-                let center = wm_rect.center() + response.drag_delta();
-                let nx = (center.x - image_rect.min.x) / image_rect.width();
-                let ny = (center.y - image_rect.min.y) / image_rect.height();
+                let anchor = match placement {
+                    Placement::Normalized { anchor, .. } => anchor.unit_offset(),
+                    _ => (0.5, 0.5),
+                };
+                let point =
+                    wm_rect.min + layer_px * Vec2::new(anchor.0, anchor.1) + response.drag_delta();
+                let nx = (point.x - image_rect.min.x) / image_rect.width();
+                let ny = (point.y - image_rect.min.y) / image_rect.height();
                 out.dragged_to = Some((nx.clamp(0.0, 1.0), ny.clamp(0.0, 1.0)));
             }
         }
@@ -206,8 +254,10 @@ fn draw_tiled(
     let center = image_rect.center();
     let half = Vec2::splat(diag / 2.0 + step_x.max(step_y));
 
-    let cols = ((half.x * 2.0) / step_x).ceil() as i32 + 1;
-    let rows = ((half.y * 2.0) / step_y).ceil() as i32 + 1;
+    let first_col = ((image_rect.width() / 2.0 - half.x) / step_x).floor() as i32;
+    let first_row = ((image_rect.height() / 2.0 - half.y) / step_y).floor() as i32;
+    let cols = ((half.x * 2.0) / step_x).ceil() as i32 + 2;
+    let rows = ((half.y * 2.0) / step_y).ceil() as i32 + 2;
     // 平铺 quad 数量在极端参数下会爆，设个上限保住帧率。
     const MAX_TILES: i32 = 4096;
     if cols * rows > MAX_TILES {
@@ -216,15 +266,15 @@ fn draw_tiled(
 
     let uv = Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0));
     let mut mesh = Mesh::with_texture(layer.texture.id());
-    let origin = center - half;
+    let origin = image_rect.min;
 
-    for row in 0..rows {
-        for col in 0..cols {
+    for row in first_row..first_row + rows {
+        for col in first_col..first_col + cols {
             let mut x = origin.x + col as f32 * step_x;
             let y = origin.y + row as f32 * step_y;
             // 奇数行错半格，和 core 把错位烘进 tile 的做法等效。
-            if stagger && row % 2 != 0 {
-                x += step_x / 2.0;
+            if stagger && row.rem_euclid(2) != 0 {
+                x += (step_x / scale / 2.0).round() * scale;
             }
             mesh.add_rect_with_uv(Rect::from_min_size(Pos2::new(x, y), layer_px), uv, tint);
         }
@@ -238,30 +288,41 @@ fn draw_tiled(
 }
 
 /// 按需重建水印图层纹理。
+#[allow(clippy::too_many_arguments)]
 fn ensure_layer(
     egui_ctx: &egui::Context,
     state: &mut PreviewState,
     renderer: &mut Renderer,
     spec: &WatermarkSpec,
     canvas: (u32, u32),
+    original_canvas: (u32, u32),
     ctx: &FieldContext,
 ) {
     let resolved_text = match &spec.content {
         Content::Text(t) => imprint_core::fields::render(&t.template, ctx),
         Content::Image(_) => String::new(),
     };
+    let size = preview_size(spec.size, canvas, original_canvas);
+    if state.layer.as_ref().is_some_and(|l| {
+        l.key.content == spec.content
+            && l.key.size == size
+            && l.key.canvas == canvas
+            && l.key.resolved_text == resolved_text
+    }) {
+        return;
+    }
     let key = LayerKey {
         content: spec.content.clone(),
-        size: spec.size,
+        size,
         canvas,
         resolved_text,
     };
 
-    if state.layer.as_ref().is_some_and(|l| l.key == key) {
-        return;
-    }
-
-    match renderer.render_layer(spec, canvas, ctx) {
+    let preview_spec = WatermarkSpec {
+        size,
+        ..spec.clone()
+    };
+    match renderer.render_layer(&preview_spec, canvas, ctx) {
         Ok(pixmap) => {
             let size = (pixmap.width(), pixmap.height());
             let image = egui::ColorImage::from_rgba_unmultiplied(
@@ -278,6 +339,20 @@ fn ensure_layer(
             state.layer = None;
             state.last_error = Some(e.to_string());
         }
+    }
+}
+
+fn preview_size(size: SizeMode, preview: (u32, u32), original: (u32, u32)) -> SizeMode {
+    match size {
+        SizeMode::AbsoluteWidth { px } => SizeMode::AbsoluteWidth {
+            px: (px as f32 * preview.0 as f32 / original.0.max(1) as f32)
+                .round()
+                .max(1.0) as u32,
+        },
+        SizeMode::AbsoluteFontSize { px } => SizeMode::AbsoluteFontSize {
+            px: px * preview.1 as f32 / original.1.max(1) as f32,
+        },
+        relative => relative,
     }
 }
 
@@ -422,6 +497,73 @@ mod tests {
             rect.width() > 1.0 && rect.height() > 1.0,
             "热区尺寸异常: {rect:?}"
         );
+    }
+
+    #[test]
+    fn original_preview_hides_the_watermark_without_changing_the_spec() {
+        let mut e = Env::new();
+        let spec = spec_at(0.5, 0.5);
+        e.state.show_original = true;
+        assert!(e.frame(&spec, Vec::new()).dragged_to.is_none());
+        assert!(e.state.layer.is_none());
+        assert!(e.watermark_rect().is_none());
+        e.state.show_original = false;
+        e.frame(&spec, Vec::new());
+        assert!(e.state.layer.is_some());
+        assert!(e.watermark_rect().is_some());
+        assert_eq!(spec, spec_at(0.5, 0.5));
+    }
+
+    #[test]
+    fn absolute_layer_is_scaled_with_the_original_image() {
+        use imprint_core::spec::{ImageSource, ImageSpec};
+        let mut bytes = Vec::new();
+        let logo = image::RgbaImage::from_pixel(8, 8, image::Rgba([255, 255, 255, 255]));
+        imprint_core::image_job::encode(
+            &logo,
+            &mut bytes,
+            imprint_core::OutputFormat::Png,
+            &Default::default(),
+        )
+        .unwrap();
+        let mut e = Env::new();
+        let spec = WatermarkSpec {
+            content: Content::Image(ImageSpec {
+                source: ImageSource::Raster(bytes),
+            }),
+            size: SizeMode::AbsoluteWidth { px: 400 },
+            ..spec_at(0.5, 0.5)
+        };
+        e.frame(&spec, Vec::new());
+        let layer = e.state.layer.as_ref().unwrap();
+        let ratio = layer.size.0 as f32 / layer.key.canvas.0 as f32;
+        assert!((ratio - 400.0 / CANVAS.0 as f32).abs() < 0.002);
+    }
+
+    #[test]
+    fn absolute_font_preview_keeps_its_proportion() {
+        assert_eq!(
+            preview_size(
+                SizeMode::AbsoluteFontSize { px: 48.0 },
+                (600, 400),
+                (2400, 1600)
+            ),
+            SizeMode::AbsoluteFontSize { px: 12.0 }
+        );
+    }
+
+    #[test]
+    fn dragging_preserves_a_noncentral_normalized_anchor() {
+        let mut e = Env::new();
+        let mut spec = spec_at(0.4, 0.4);
+        spec.placement = Placement::Normalized {
+            x: 0.4,
+            y: 0.4,
+            anchor: Anchor9::TopLeft,
+        };
+        let (x, y) = e.drag(&spec, egui::vec2(20.0, 0.0)).unwrap();
+        assert!(x > 0.4);
+        assert!((y - 0.4).abs() < 0.002);
     }
 
     #[test]
